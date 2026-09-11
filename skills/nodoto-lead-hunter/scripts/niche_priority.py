@@ -15,6 +15,7 @@ counts it can derive from bogota_leads.csv / the live Sheet.
 
 from __future__ import annotations
 import csv
+import math
 import sys
 from collections import defaultdict
 from dataclasses import dataclass
@@ -23,6 +24,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from schema import Lead  # noqa: E402
 
+# Static business-value / urgency priors (0-10), one entry per niche in
+# docs/outreach_playbook.md section "PERFIL DEL LEAD IDEAL" / the 50-niche list.
+# Edit this table as NODOTO's own experience updates (e.g. after a niche closes
+# deals faster/slower than expected). Values are directional, not measured.
 NICHE_VALUE_PRIORS: dict[str, float] = {
     "cirujanos plasticos": 9.5, "dentistas cosmeticos": 8.0, "ortodoncistas": 7.5,
     "fertilidad": 9.0, "quiropracticos deportivos": 6.5, "perdida de peso medica": 7.5,
@@ -55,7 +60,8 @@ class NicheStats:
 
     @property
     def coverage_penalty(self) -> float:
-        return min(self.existing_leads / 20.0, 1.0)
+        """More existing leads in this niche -> lower remaining-opportunity score."""
+        return min(self.existing_leads / 20.0, 1.0)  # saturates at 20+ existing leads
 
     @property
     def website_gap_rate(self) -> float:
@@ -74,6 +80,12 @@ def _slugify_niche(value: str) -> str:
 
 
 def load_niche_stats_from_repo(repo_root: Path) -> dict[str, NicheStats]:
+    """Derives NicheStats from bogota_leads.csv — the ACTUAL header this skill
+    writes is schema.COLUMNS ('Niche', 'Owner Name', 'Owner Phone', ...), so
+    this reads it via Lead.from_dict instead of assuming a different, older
+    column layout (that mismatch was an audit finding: owner_identified_count
+    and owner_phone_count silently stayed at 0 forever against the real
+    memory file, even with real owner data recorded in every row)."""
     stats: dict[str, NicheStats] = defaultdict(lambda: NicheStats(niche=""))
     path = repo_root / "data" / "bogota_leads.csv"
     if not path.exists():
@@ -96,6 +108,9 @@ def load_niche_stats_from_repo(repo_root: Path) -> dict[str, NicheStats]:
 
 
 def merge_sheet_owner_stats(stats: dict[str, NicheStats], sheet_rows: list[dict]) -> None:
+    """Fold in owner-identification / owner-phone counts from whatever is
+    already in the live Google Sheet (or its CSV mirror), keyed by the sheet's
+    own 'Niche' column."""
     for row in sheet_rows:
         key = _slugify_niche(row.get("Niche", ""))
         s = stats.setdefault(key, NicheStats(niche=row.get("Niche", "")))
@@ -108,11 +123,12 @@ def merge_sheet_owner_stats(stats: dict[str, NicheStats], sheet_rows: list[dict]
 
 
 def niche_opportunity_score(niche_key: str, stats: dict[str, NicheStats]) -> float:
-    value_prior = NICHE_VALUE_PRIORS.get(niche_key, 6.0)
+    """0-10. Higher = better niche to work next."""
+    value_prior = NICHE_VALUE_PRIORS.get(niche_key, 6.0)  # neutral default for unmapped niches
     s = stats.get(niche_key, NicheStats(niche=niche_key))
     remaining_opportunity = 1.0 - s.coverage_penalty
     website_gap = s.website_gap_rate
-    owner_access_gap = 1.0 - s.owner_access_rate
+    owner_access_gap = 1.0 - s.owner_access_rate  # more room = more owners still to find
 
     score = (
         value_prior * 0.40
@@ -121,6 +137,41 @@ def niche_opportunity_score(niche_key: str, stats: dict[str, NicheStats]) -> flo
         + owner_access_gap * 10 * 0.15
     )
     return round(min(score, 10.0), 2)
+
+
+def estimate_raw_candidates_needed(
+    niche_key: str,
+    stats: dict[str, NicheStats],
+    target_qualified: int = 10,
+    default_qualify_rate: float = 0.12,
+) -> int:
+    """v3.1 efficiency addition (audit 2026-09-11, "edge of perfection" pass).
+
+    30-50 extremely qualified leads/day only happens if the RAW discovery
+    funnel is sized correctly per niche — discovering a fixed 20-40 candidates
+    regardless of niche wastes research effort on niches where owner phones are
+    historically hard to find, and under-discovers niches where they're easy.
+
+    Uses `owner_access_rate` (already computed from real bogota_leads.csv
+    history — no new tracking file needed) as the best available proxy for the
+    eventual qualify rate, since the qualification gate's hard bottleneck is
+    exactly DIRECT/NAMED_ATTRIBUTION owner-phone confidence. A niche with too
+    little history (<5 existing leads) falls back to `default_qualify_rate`
+    (conservative: assume most candidates will fail on owner-phone alone —
+    better to over-discover an unproven niche than run short of the target).
+
+    Always returns at least 2x the target (some attrition is universal even in
+    the best niches) and caps at 12x (beyond that, split across multiple
+    niches in parallel per SKILL.md's "Escalamiento en paralelo" section
+    instead of over-mining one niche).
+    """
+    s = stats.get(niche_key)
+    if s and s.existing_leads >= 5:
+        qualify_rate = max(s.owner_access_rate, 0.02)
+    else:
+        qualify_rate = default_qualify_rate
+    needed = math.ceil(target_qualified / qualify_rate)
+    return max(target_qualified * 2, min(needed, target_qualified * 12))
 
 
 def rank_niches(repo_root: Path, sheet_rows: list[dict] | None = None) -> list[tuple[str, float, NicheStats]]:
