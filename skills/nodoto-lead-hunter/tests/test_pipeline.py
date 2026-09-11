@@ -77,11 +77,31 @@ def test_gate_rejects_business_phone_relabeled_as_owner_phone():
           result.status == QUALIFICATION_STATUS_OWNER_PHONE_MISSING)
 
 
+def test_gate_rejects_missing_owner_phone_confidence():
+    """v2 rule: even a specific, non-generic phone source is not enough — the
+    lead must also carry a DIRECT/NAMED_ATTRIBUTION confidence tier, or it's
+    treated as unverified (guards against a plausible-sounding source that
+    still turns out to be the receptionist/front-desk line)."""
+    lead = Lead(
+        business_name="Clinica Estetica Z", niche="Cirujanos plásticos",
+        owner_name="Dra. Marcela Diaz", owner_role="Fundadora",
+        owner_phone="+57 300 111 2222",
+        owner_phone_source="Directorio medico especifico, ficha nombrando a la Dra. Diaz",
+        website_problem="Homepage has no CTA above the fold.",
+        website_evidence="Checked 2026-09-11: hero section has no button or phone link visible without scrolling.",
+        high_ticket_score=9, website_opportunity_score=8, owner_access_score=8, data_quality_score=8,
+    )
+    result = run_qualification_gate(lead)
+    check("owner phone without a confidence tier is treated as unverified",
+          result.status == QUALIFICATION_STATUS_OWNER_PHONE_MISSING)
+
+
 def test_gate_accepts_fully_verified_vip_lead():
     lead = Lead(
         business_name="Centro de Fertilidad Bogotá", niche="Fertilidad",
         owner_name="Dr. Mauricio Salas", owner_role="Director médico y fundador",
         owner_phone="+57 315 555 0044", owner_phone_source="Instagram oficial @dr.mauriciosalas (bio + destacada 'Agenda tu cita')",
+        owner_phone_confidence="DIRECT",
         website="https://centrofertilidadbogota.example",
         website_problem="Mobile menu overlaps the hero text and the booking form times out on submit.",
         website_evidence="Tested on iPhone viewport 2026-09-11: hamburger menu opens over the H1; submitting the appointment form returns a blank page after 30s.",
@@ -98,6 +118,7 @@ def test_csv_output_roundtrip(tmp_dir: Path):
         business_name="Ortodoncia Premium Bogotá", niche="Ortodoncistas",
         owner_name="Dra. Laura Niño", owner_role="Fundadora",
         owner_phone="+57 320 555 0077", owner_phone_source="Website profesional (sección Contacto)",
+        owner_phone_confidence="DIRECT",
         website_problem="No social proof anywhere on the site (no reviews, no before/after gallery).",
         website_evidence="Homepage and 3 subpages checked 2026-09-11: zero testimonials, zero patient photos.",
         high_ticket_score=8, website_opportunity_score=8.5, owner_access_score=8, data_quality_score=7.5,
@@ -186,6 +207,7 @@ if __name__ == "__main__":
     test_dedupe_same_professional_different_names()
     test_gate_rejects_missing_owner_phone()
     test_gate_rejects_business_phone_relabeled_as_owner_phone()
+    test_gate_rejects_missing_owner_phone_confidence()
     test_gate_accepts_fully_verified_vip_lead()
     test_unset_business_email_never_causes_false_duplicate()
     test_fuzzy_match_flags_without_dropping()
