@@ -20,7 +20,8 @@ COLUMNS = [
     # BUSINESS
     "Business Name", "Niche", "Sub-Niche", "City", "Neighborhood", "Address", "Google Maps",
     # OWNER
-    "Owner Name", "Owner Role", "Owner Phone", "Owner Phone Source", "Owner LinkedIn", "Owner Instagram",
+    "Owner Name", "Owner Role", "Owner Phone", "Owner Phone Source", "Owner Phone Confidence",
+    "Owner LinkedIn", "Owner Instagram",
     # BUSINESS CONTACT
     "Business Phone", "Business WhatsApp", "Business Email",
     # DIGITAL
@@ -35,9 +36,15 @@ COLUMNS = [
 # Fields that MUST be present and non-placeholder for a lead to ever reach "Qualified Leads".
 REQUIRED_FOR_QUALIFIED = [
     "Business Name", "Niche", "City",
-    "Owner Name", "Owner Role", "Owner Phone", "Owner Phone Source",
+    "Owner Name", "Owner Role", "Owner Phone", "Owner Phone Source", "Owner Phone Confidence",
     "Website Problem", "Website Evidence",
 ]
+
+# Owner Phone Confidence must be one of these — see memory repo's
+# docs/owner_phone_sources.md for the definitions. Anything else (including
+# empty) means the number could not be tied specifically to the decision-maker
+# and must stay NOT_VERIFIED rather than be accepted as an owner phone.
+VALID_OWNER_PHONE_CONFIDENCE = {"DIRECT", "NAMED_ATTRIBUTION"}
 
 NOT_VERIFIED = "NOT_VERIFIED"
 NOT_VERIFIED_ALIASES = {"NOT_VERIFIED", "NO_VERIFIED", "N/A", "NA", "", "NONE", "UNKNOWN", "TBD"}
@@ -70,6 +77,7 @@ class Lead:
     owner_role: str = NOT_VERIFIED
     owner_phone: str = NOT_VERIFIED
     owner_phone_source: str = NOT_VERIFIED
+    owner_phone_confidence: str = NOT_VERIFIED  # "DIRECT" | "NAMED_ATTRIBUTION" | NOT_VERIFIED
     owner_linkedin: str = NOT_VERIFIED
     owner_instagram: str = NOT_VERIFIED
 
@@ -108,7 +116,9 @@ class Lead:
             "City": self.city, "Neighborhood": self.neighborhood, "Address": self.address,
             "Google Maps": self.google_maps,
             "Owner Name": self.owner_name, "Owner Role": self.owner_role, "Owner Phone": self.owner_phone,
-            "Owner Phone Source": self.owner_phone_source, "Owner LinkedIn": self.owner_linkedin,
+            "Owner Phone Source": self.owner_phone_source,
+            "Owner Phone Confidence": self.owner_phone_confidence,
+            "Owner LinkedIn": self.owner_linkedin,
             "Owner Instagram": self.owner_instagram,
             "Business Phone": self.business_phone, "Business WhatsApp": self.business_whatsapp,
             "Business Email": self.business_email,
@@ -130,7 +140,9 @@ class Lead:
             "Business Name": "business_name", "Niche": "niche", "Sub-Niche": "sub_niche", "City": "city",
             "Neighborhood": "neighborhood", "Address": "address", "Google Maps": "google_maps",
             "Owner Name": "owner_name", "Owner Role": "owner_role", "Owner Phone": "owner_phone",
-            "Owner Phone Source": "owner_phone_source", "Owner LinkedIn": "owner_linkedin",
+            "Owner Phone Source": "owner_phone_source",
+            "Owner Phone Confidence": "owner_phone_confidence",
+            "Owner LinkedIn": "owner_linkedin",
             "Owner Instagram": "owner_instagram", "Business Phone": "business_phone",
             "Business WhatsApp": "business_whatsapp", "Business Email": "business_email",
             "Website": "website", "Website Status": "website_status", "Website Problem": "website_problem",
