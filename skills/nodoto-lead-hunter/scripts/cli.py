@@ -47,7 +47,7 @@ from scoring import run_qualification_gate  # noqa: E402
 from validate import validate_evidence_quality  # noqa: E402
 from sheets_io import write_csv_mirror  # noqa: E402
 from report import RunStats, render_report, build_clean_export_table, CLEAN_EXPORT_HEADERS  # noqa: E402
-from niche_priority import rank_niches  # noqa: E402
+from niche_priority import rank_niches, estimate_raw_candidates_needed  # noqa: E402
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -102,6 +102,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             discarded.append((lead, quality.errors))
             continue
 
+        # A qualified lead's own fingerprint joins `existing` immediately so two
+        # near-identical candidates in the SAME batch can't both slip through.
         existing.append(_fingerprint(lead))
         qualified.append(lead)
 
@@ -171,9 +173,11 @@ def cmd_rank_niches(args: argparse.Namespace) -> int:
     if args.sheet_rows:
         sheet_rows = json.loads(Path(args.sheet_rows).read_text(encoding="utf-8"))
     ranked = rank_niches(repo_root, sheet_rows)
-    print(f"{'Niche Opportunity Score':<26}{'Niche key':<40}{'Existing leads':<16}{'Website gap %':<15}")
+    target = args.target_qualified
+    print(f"{'Score':<8}{'Niche key':<40}{'Existing':<10}{'Web gap %':<11}{'Raw needed (target='+str(target)+')':<26}")
     for key, score, stats in ranked[:20]:
-        print(f"{score:<26}{key:<40}{stats.existing_leads:<16}{stats.website_gap_rate * 100:<15.0f}")
+        raw_needed = estimate_raw_candidates_needed(key, {key: stats}, target_qualified=target)
+        print(f"{score:<8}{key:<40}{stats.existing_leads:<10}{stats.website_gap_rate * 100:<11.0f}{raw_needed:<26}")
     return 0
 
 
@@ -192,6 +196,8 @@ def main() -> int:
     p_rank = sub.add_parser("rank-niches", help="Print the Niche Opportunity Score ranking")
     p_rank.add_argument("--repo-root", default=".", help="Path to nodoto-cold-outreach repo root")
     p_rank.add_argument("--sheet-rows", default=None, help="Optional JSON export of the live Sheet's rows")
+    p_rank.add_argument("--target-qualified", type=int, default=10,
+                         help="Qualified leads wanted from this niche today, for sizing the raw discovery batch")
     p_rank.set_defaults(func=cmd_rank_niches)
 
     args = parser.parse_args()
