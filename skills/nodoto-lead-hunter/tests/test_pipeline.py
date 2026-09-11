@@ -1,7 +1,7 @@
 """
-Self-test for the deterministic parts of NODOTO LEAD HUNTER (schema, dedupe,
-scoring gate, CSV output). Does NOT touch the network, Composio, or the repo's
-real data files unless run with --against-repo.
+Self-test for the deterministic parts of NODOTO LEAD HUNTER v3 (schema,
+multi-decision-maker, dedupe, Lead Quality / Contact Quality scoring, gate,
+CSV output, clean export). Does NOT touch the network or Composio.
 
 Run:
     python3 skills/nodoto-lead-hunter/tests/test_pipeline.py
@@ -13,12 +13,26 @@ from pathlib import Path
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from schema import Lead, NOT_VERIFIED, QUALIFICATION_STATUS_OWNER_PHONE_MISSING, QUALIFICATION_STATUS_QUALIFIED, QUALIFICATION_STATUS_DISCARDED  # noqa: E402
-from dedupe import fingerprint_lead, find_duplicate, find_fuzzy_candidates, normalize_text, normalize_phone, normalize_domain, normalize_email  # noqa: E402
-from scoring import run_qualification_gate, compute_lead_score  # noqa: E402
+from schema import (  # noqa: E402
+    Lead, DecisionMaker, NOT_VERIFIED,
+    QUALIFICATION_STATUS_OWNER_PHONE_MISSING, QUALIFICATION_STATUS_QUALIFIED,
+    PHONE_CONFIDENCE_DIRECT, PHONE_CONFIDENCE_NAMED_ATTRIBUTION,
+    PHONE_CONFIDENCE_VERIFIED_BUSINESS, PHONE_CONFIDENCE_GENERIC,
+    VERIFICATION_STATUS_VERIFIED, VERIFICATION_STATUS_CONTRADICTED,
+    AUTHORITY_FINAL, AUTHORITY_INFLUENCER,
+)
+from dedupe import (  # noqa: E402
+    fingerprint_lead, find_duplicate, find_fuzzy_candidates, find_decision_maker_reuse,
+    fingerprint_all_decision_makers, normalize_text, normalize_phone, normalize_domain, normalize_email,
+)
+from scoring import (  # noqa: E402
+    run_qualification_gate, compute_lead_quality_score, compute_contact_quality_score,
+    phone_format_is_plausible,
+)
 from sheets_io import write_csv_mirror, plan_write, verify_write  # noqa: E402
 from validate import validate_evidence_quality  # noqa: E402
-from niche_priority import rank_niches, niche_opportunity_score, load_niche_stats_from_repo  # noqa: E402
+from report import build_clean_export_table  # noqa: E402
+from niche_priority import rank_niches, load_niche_stats_from_repo  # noqa: E402
 
 
 def check(label, condition):
@@ -26,6 +40,209 @@ def check(label, condition):
     print(f"[{status}] {label}")
     if not condition:
         raise AssertionError(f"Check failed: {label}")
+
+
+def _base_kwargs(**overrides):
+    kwargs = dict(
+        business_name="Clinica Base", niche="Dermatologia laser", city="Bogotá",
+        website="https://clinicabase.example",
+        website_problem="Homepage has no primary CTA above the fold and the only contact path is a footer phone.",
+        website_evidence="Checked 2026-09-11: hero section has no button, no WhatsApp link, no booking widget.",
+        high_ticket_score=8, website_opportunity_score=8, data_quality_score=8,
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+def _direct_person(name="Dra. Ana Gomez", role="Fundadora y Directora Medica", priority=1):
+    return DecisionMaker(
+        name=name, role=role, authority_level=AUTHORITY_FINAL, is_current=True,
+        phone="+57 315 555 0044", phone_confidence=PHONE_CONFIDENCE_DIRECT,
+        phone_source="Sitio web propio de la doctora, seccion 'Agenda tu cita'",
+        phone_evidence="El boton de WhatsApp en dranagomez.com/contacto abre wa.me/573155550044, "
+                       "el mismo numero aparece en su bio de Instagram personal @dra.anagomez.",
+        verification_status=VERIFICATION_STATUS_VERIFIED, priority=priority,
+    )
+
+
+def test_e2e_single_decision_maker_qualifies():
+    lead = Lead(**_base_kwargs(business_name="Clinica Un Decisor"))
+    lead.set_decision_makers([_direct_person()])
+    result = run_qualification_gate(lead)
+    check("E2E-1 single decision-maker with DIRECT phone qualifies",
+          result.passed and result.status == QUALIFICATION_STATUS_QUALIFIED)
+    check("E2E-1 decision_maker_count is 1", lead.decision_maker_count == 1)
+    check("E2E-1 lead_quality_score and contact_quality_score are both set",
+          lead.lead_quality_score is not None and lead.contact_quality_score is not None)
+    check("E2E-1 contact quality is high for a DIRECT, verified, evidenced phone",
+          lead.contact_quality_score >= 8.0)
+
+
+def test_e2e_multiple_decision_makers_preserved():
+    primary = _direct_person(name="Carlos Ruiz", role="Socio Fundador", priority=1)
+    secondary = DecisionMaker(
+        name="Maria Torres", role="Socia Directora de Operaciones", authority_level=AUTHORITY_INFLUENCER,
+        is_current=True, phone="+57 310 222 3344", phone_confidence=PHONE_CONFIDENCE_NAMED_ATTRIBUTION,
+        phone_source="Perfil verificado en el directorio del Colegio de Abogados, ficha a su nombre",
+        phone_evidence="El directorio del colegio profesional nombra a Maria Torres junto a este numero "
+                       "como contacto de agendamiento; coincide con el numero en su LinkedIn personal.",
+        verification_status=VERIFICATION_STATUS_VERIFIED, priority=2,
+    )
+    lead = Lead(**_base_kwargs(business_name="Bufete Multi Socio", niche="Abogados corporativos"))
+    lead.set_decision_makers([primary, secondary])
+
+    result = run_qualification_gate(lead)
+    check("E2E-2 multi-decision-maker lead still qualifies via the prioritized primary",
+          result.passed and result.status == QUALIFICATION_STATUS_QUALIFIED)
+    check("E2E-2 decision_maker_count is 2 (secondary preserved, not dropped)", lead.decision_maker_count == 2)
+    check("E2E-2 secondary decision-maker appears in the summary",
+          "Maria Torres" in lead.secondary_decision_makers_summary)
+    quality = validate_evidence_quality(lead)
+    check("E2E-2 validator does not complain when the secondary IS recorded", quality.ok)
+
+    broken = Lead(**_base_kwargs(business_name="Bufete Roto"))
+    broken.decision_makers = [primary, secondary]
+    broken.owner_name = primary.name
+    broken.set_decision_makers([primary])
+    broken.decision_makers.append(secondary)
+    check("E2E-2b decision_maker_count reflects the real list length even if set oddly",
+          broken.decision_maker_count == 2)
+
+
+def test_e2e_generic_and_verified_business_phone_never_qualify():
+    for confidence, label in [
+        (PHONE_CONFIDENCE_GENERIC, "GENERIC (switchboard/WhatsApp Business menu)"),
+        (PHONE_CONFIDENCE_VERIFIED_BUSINESS, "VERIFIED_BUSINESS (real but not the decision-maker's)"),
+    ]:
+        lead = Lead(**_base_kwargs(business_name=f"Negocio Solo Telefono General ({label})"))
+        person = DecisionMaker(
+            name="Gerente General", role="Gerente", authority_level=AUTHORITY_FINAL, is_current=True,
+            phone="+57 601 555 1234", phone_confidence=confidence,
+            phone_source="Ficha de Google Maps del negocio",
+            phone_evidence="Numero listado como telefono principal en la ficha de Google Business.",
+        )
+        lead.set_decision_makers([person])
+        result = run_qualification_gate(lead)
+        check(f"E2E-3 {label} phone alone is rejected, never treated as an owner phone",
+              result.status == QUALIFICATION_STATUS_OWNER_PHONE_MISSING and not result.passed)
+
+
+def test_e2e_named_attribution_qualifies():
+    lead = Lead(**_base_kwargs(business_name="Consultorio Registro Publico"))
+    person = DecisionMaker(
+        name="Dr. Julian Vega", role="Odontologo titular", authority_level=AUTHORITY_FINAL, is_current=True,
+        phone="+57 320 444 5566", phone_confidence=PHONE_CONFIDENCE_NAMED_ATTRIBUTION,
+        phone_source="Perfil de Doctoralia a su nombre, seccion 'Agendar cita'",
+        phone_evidence="El perfil de Doctoralia verificado con su nombre completo y matricula profesional "
+                       "publica este numero como su linea directa de agendamiento.",
+        verification_status=VERIFICATION_STATUS_VERIFIED,
+    )
+    lead.set_decision_makers([person])
+    result = run_qualification_gate(lead)
+    check("E2E-4 NAMED_ATTRIBUTION from a public professional directory qualifies",
+          result.passed and result.status == QUALIFICATION_STATUS_QUALIFIED)
+
+
+def test_e2e_contradictory_sources_blocks_qualification():
+    lead = Lead(**_base_kwargs(business_name="Clinica Contradictoria"))
+    person = DecisionMaker(
+        name="Dra. Paola Rios", role="Fundadora", authority_level=AUTHORITY_FINAL, is_current=True,
+        phone="+57 300 111 2222", phone_confidence=PHONE_CONFIDENCE_DIRECT,
+        phone_source="Sitio web propio",
+        phone_evidence="El sitio propio muestra este numero, pero Instagram personal muestra un numero "
+                       "distinto (+57 300 999 8888) para la misma doctora.",
+        phone_discrepancy="Sitio web dice +57 300 111 2222; Instagram personal (mas reciente, actualizado "
+                           "hace 2 semanas) dice +57 300 999 8888. No se pudo confirmar cual es el actual.",
+        verification_status=VERIFICATION_STATUS_CONTRADICTED,
+    )
+    lead.set_decision_makers([person])
+    result = run_qualification_gate(lead)
+    check("E2E-5 CONTRADICTED verification status blocks qualification even with DIRECT confidence",
+          result.status == QUALIFICATION_STATUS_OWNER_PHONE_MISSING and not result.passed)
+
+
+def test_e2e_no_website_still_qualifies_with_evidence():
+    lead = Lead(**_base_kwargs(
+        business_name="Consultorio Sin Web",
+        website=NOT_VERIFIED,
+        website_problem="No existe sitio propio; la unica presencia digital es una pagina de Facebook "
+                         "sin publicaciones desde hace 8 meses y sin boton de contacto directo.",
+        website_evidence="Revisado 2026-09-11: busqueda del nombre del negocio + 'Bogota' no arroja sitio "
+                          "propio; la pagina de Facebook 'Consultorio Sin Web' tiene ultima publicacion "
+                          "en enero 2026 y el boton de 'Enviar mensaje' no esta configurado.",
+    ))
+    lead.website_status = "no_website"
+    lead.set_decision_makers([_direct_person(name="Dr. Felipe Soto", role="Titular")])
+    result = run_qualification_gate(lead)
+    check("E2E-6 missing website does not block qualification",
+          result.passed and result.status == QUALIFICATION_STATUS_QUALIFIED)
+
+
+def test_e2e_multi_location_business():
+    lead = Lead(**_base_kwargs(
+        business_name="Cadena Multi Sede",
+        notes="Cadena con 4 sedes en Bogota (Chapinero, Usaquen, Salitre, Kennedy).",
+        high_ticket_score=9, website_opportunity_score=7, data_quality_score=8,
+    ))
+    lead.set_decision_makers([_direct_person(name="Andres Molina", role="Fundador y CEO")])
+    result = run_qualification_gate(lead)
+    check("E2E-7 multi-location business qualifies normally on its own merits",
+          result.passed and result.status == QUALIFICATION_STATUS_QUALIFIED)
+    check("E2E-7 lead_quality_score reflects the (higher) business signals independent of contact",
+          lead.lead_quality_score >= 8.0)
+
+
+def test_e2e_former_founder_is_rejected():
+    lead = Lead(**_base_kwargs(business_name="Clinica Fundador Retirado"))
+    person = _direct_person(name="Dr. Ricardo Nunez", role="Fundador (retirado en 2024)")
+    person.is_current = False
+    person.notes = "Un articulo de prensa de 2024 confirma que vendio la clinica y ya no la dirige."
+    lead.set_decision_makers([person])
+    result = run_qualification_gate(lead)
+    check("E2E-8 a founder confirmed no longer in charge is rejected even with a DIRECT phone",
+          result.status == QUALIFICATION_STATUS_OWNER_PHONE_MISSING and not result.passed)
+    check("E2E-8 contact_quality_score is capped low for a non-current decision-maker",
+          compute_contact_quality_score(lead) <= 1.0)
+
+
+def test_phone_format_sanity_check():
+    check("plausible Colombian mobile passes", phone_format_is_plausible("+57 315 555 0044"))
+    check("too-short garbled number is rejected", not phone_format_is_plausible("+57 55"))
+    check("too-long garbled number is rejected", not phone_format_is_plausible("123456789012345"))
+
+    lead = Lead(**_base_kwargs(business_name="Numero Invalido"))
+    person = _direct_person()
+    person.phone = "12"
+    lead.set_decision_makers([person])
+    result = run_qualification_gate(lead)
+    check("a DIRECT-confidence lead with an implausible phone format is still rejected",
+          not result.passed)
+
+
+def test_invalid_confidence_enum_is_rejected():
+    lead = Lead(**_base_kwargs(business_name="Confidence Inventada"))
+    person = _direct_person()
+    person.phone_confidence = "TOTALLY_SURE"
+    lead.set_decision_makers([person])
+    result = run_qualification_gate(lead)
+    check("an invented confidence value is rejected outright rather than silently accepted",
+          not result.passed)
+
+
+def test_decision_maker_reuse_is_flagged_not_dropped():
+    existing_lead = Lead(**_base_kwargs(business_name="Firma Original"))
+    existing_lead.set_decision_makers([_direct_person(name="Sofia Lara", role="Socia")])
+    existing_records = fingerprint_all_decision_makers(existing_lead, source="bogota_leads.csv")
+
+    new_lead = Lead(**_base_kwargs(business_name="Consultorio Propio de Sofia"))
+    new_lead.set_decision_makers([_direct_person(name="Sofia Lara", role="Titular")])
+
+    hits = find_decision_maker_reuse(new_lead, existing_records)
+    check("the same person surfacing as decision-maker on a second business is flagged",
+          len(hits) == 1)
+    result = run_qualification_gate(new_lead)
+    check("a reuse flag does not by itself block qualification (it's a review flag, not a rejection)",
+          result.passed)
 
 
 def test_normalization():
@@ -49,88 +266,38 @@ def test_dedupe_same_professional_different_names():
 
 
 def test_gate_rejects_missing_owner_phone():
-    lead = Lead(
-        business_name="Clínica Estética Bogotá", niche="Dermatología láser",
-        owner_name="Dra. Ana Gómez", owner_role="Directora médica",
-        owner_phone=NOT_VERIFIED, owner_phone_source=NOT_VERIFIED,
-        website_problem="No primary CTA above the fold; only contact path is a footer phone number.",
-        website_evidence="Reviewed homepage 2026-09-11: hero section has no button, no WhatsApp link, no booking widget.",
-        high_ticket_score=8, website_opportunity_score=9, owner_access_score=6, data_quality_score=5,
-    )
+    lead = Lead(**_base_kwargs(business_name="Clinica Sin Telefono"))
     result = run_qualification_gate(lead)
     check("missing owner phone forces OWNER_PHONE_MISSING regardless of score",
           result.status == QUALIFICATION_STATUS_OWNER_PHONE_MISSING and not result.passed)
 
 
 def test_gate_rejects_business_phone_relabeled_as_owner_phone():
-    lead = Lead(
-        business_name="Bufete Legal X", niche="Abogados corporativos",
-        owner_name="Carlos Ruiz", owner_role="Socio Director",
-        business_phone="+57 601 555 9999",
-        owner_phone="+57 601 555 9999", owner_phone_source="Google Business Profile (business listing)",
-        website_problem="Site has not been updated since 2019 and lists dissolved practice areas.",
-        website_evidence="Footer copyright reads 2019; 'Derecho Digital' service page returns a 404.",
-        high_ticket_score=9, website_opportunity_score=8, owner_access_score=7, data_quality_score=6,
+    lead = Lead(**_base_kwargs(business_name="Bufete Legal X", niche="Abogados corporativos"))
+    lead.business_phone = "+57 601 555 9999"
+    person = DecisionMaker(
+        name="Carlos Ruiz", role="Socio Director", authority_level=AUTHORITY_FINAL, is_current=True,
+        phone="+57 601 555 9999", phone_confidence=PHONE_CONFIDENCE_DIRECT,
+        phone_source="Google Business Profile (business listing)",
+        phone_evidence="Mismo numero que aparece en la ficha de Google del negocio.",
     )
+    lead.set_decision_makers([person])
     result = run_qualification_gate(lead)
-    check("business phone silently relabeled as owner phone is rejected",
+    check("business phone relabeled as owner phone (no 'owner' in source) is rejected",
           result.status == QUALIFICATION_STATUS_OWNER_PHONE_MISSING)
-
-
-def test_gate_rejects_missing_owner_phone_confidence():
-    """v2 rule: even a specific, non-generic phone source is not enough — the
-    lead must also carry a DIRECT/NAMED_ATTRIBUTION confidence tier, or it's
-    treated as unverified (guards against a plausible-sounding source that
-    still turns out to be the receptionist/front-desk line)."""
-    lead = Lead(
-        business_name="Clinica Estetica Z", niche="Cirujanos plásticos",
-        owner_name="Dra. Marcela Diaz", owner_role="Fundadora",
-        owner_phone="+57 300 111 2222",
-        owner_phone_source="Directorio medico especifico, ficha nombrando a la Dra. Diaz",
-        website_problem="Homepage has no CTA above the fold.",
-        website_evidence="Checked 2026-09-11: hero section has no button or phone link visible without scrolling.",
-        high_ticket_score=9, website_opportunity_score=8, owner_access_score=8, data_quality_score=8,
-    )
-    result = run_qualification_gate(lead)
-    check("owner phone without a confidence tier is treated as unverified",
-          result.status == QUALIFICATION_STATUS_OWNER_PHONE_MISSING)
-
-
-def test_gate_accepts_fully_verified_vip_lead():
-    lead = Lead(
-        business_name="Centro de Fertilidad Bogotá", niche="Fertilidad",
-        owner_name="Dr. Mauricio Salas", owner_role="Director médico y fundador",
-        owner_phone="+57 315 555 0044", owner_phone_source="Instagram oficial @dr.mauriciosalas (bio + destacada 'Agenda tu cita')",
-        owner_phone_confidence="DIRECT",
-        website="https://centrofertilidadbogota.example",
-        website_problem="Mobile menu overlaps the hero text and the booking form times out on submit.",
-        website_evidence="Tested on iPhone viewport 2026-09-11: hamburger menu opens over the H1; submitting the appointment form returns a blank page after 30s.",
-        instagram="https://instagram.com/dr.mauriciosalas",
-        high_ticket_score=9.5, website_opportunity_score=9, owner_access_score=9, data_quality_score=8.5,
-    )
-    result = run_qualification_gate(lead)
-    check("fully verified high-scoring lead passes the gate as QUALIFIED", result.passed and result.status == QUALIFICATION_STATUS_QUALIFIED)
-    check("lead tier computed correctly", lead.lead_tier in ("VIP", "A"))
 
 
 def test_csv_output_roundtrip(tmp_dir: Path):
-    qualified = Lead(
-        business_name="Ortodoncia Premium Bogotá", niche="Ortodoncistas",
-        owner_name="Dra. Laura Niño", owner_role="Fundadora",
-        owner_phone="+57 320 555 0077", owner_phone_source="Website profesional (sección Contacto)",
-        owner_phone_confidence="DIRECT",
-        website_problem="No social proof anywhere on the site (no reviews, no before/after gallery).",
-        website_evidence="Homepage and 3 subpages checked 2026-09-11: zero testimonials, zero patient photos.",
-        high_ticket_score=8, website_opportunity_score=8.5, owner_access_score=8, data_quality_score=7.5,
-    )
+    qualified = Lead(**_base_kwargs(business_name="Ortodoncia Premium Bogotá", niche="Ortodoncistas"))
+    qualified.set_decision_makers([_direct_person(name="Dra. Laura Niño", role="Fundadora")])
     run_qualification_gate(qualified)
-    owner_missing = Lead(business_name="Estudio de Arquitectura Y", niche="Arquitectos de lujo",
-                          owner_phone=NOT_VERIFIED, owner_phone_source=NOT_VERIFIED)
+    owner_missing = Lead(business_name="Estudio de Arquitectura Y", niche="Arquitectos de lujo")
     paths = write_csv_mirror([qualified], [owner_missing], tmp_dir, run_id="selftest")
     check("qualified CSV written", Path(paths["qualified_csv"]).exists())
     check("owner-missing CSV written", Path(paths["owner_missing_csv"]).exists())
 
-    header = list(Lead().to_row.__globals__["COLUMNS"])
+    from schema import COLUMNS
+    header = list(COLUMNS)
     rows = plan_write([qualified], header)
     ok, msg = verify_write(expected_new_rows=1, rows_before=5, rows_after=6,
                             expected_business_names=["Ortodoncia Premium Bogotá"],
@@ -142,11 +309,13 @@ def test_csv_output_roundtrip(tmp_dir: Path):
                               actual_last_rows=rows, header=header)
     check("verify_write logic catches a row-count mismatch", not ok_bad)
 
+    exported = build_clean_export_table([qualified])
+    check("clean export table has exactly one row per qualified lead", len(exported) == 1)
+    check("clean export row answers 'who to contact' and 'how' directly",
+          exported[0]["Decisor principal"] != "NOT FOUND" and exported[0]["Teléfono decisor"] != "NOT FOUND")
+
 
 def test_unset_business_email_never_causes_false_duplicate():
-    """Regression: two unrelated leads that both leave Business Email unset
-    (defaulting to NOT_VERIFIED) must NOT be flagged as duplicates of each
-    other just because they share that placeholder string."""
     lead_a = Lead(business_name="Ortodoncia Alfa", owner_name="Ana Gómez",
                   owner_phone="+57 300 000 0001", website="https://alfa.example")
     lead_b = Lead(business_name="Ortodoncia Beta", owner_name="Beto Ruiz",
@@ -177,6 +346,7 @@ def test_validate_rejects_generic_source_and_vague_problem():
         business_name="X", owner_name="Y", owner_role="Owner",
         owner_phone="+57 300 000 0003",
         owner_phone_source="Website profesional, pagina de contacto, seccion 'Agende su cita'",
+        owner_phone_evidence="El boton de WhatsApp de esa pagina abre wa.me con este mismo numero.",
         website_problem="The contact page lists a WhatsApp link that opens to a number with no active WhatsApp Business account.",
         website_evidence="Clicked the WhatsApp icon on /contacto on 2026-09-11; wa.me link opens but the number shows 'not on WhatsApp'.",
     )
@@ -184,42 +354,156 @@ def test_validate_rejects_generic_source_and_vague_problem():
     check("specific, well-sourced evidence passes validation", result2.ok)
 
 
-def test_niche_priority_runs_against_repo():
-    repo_root = Path(__file__).resolve().parents[3]
-    stats = load_niche_stats_from_repo(repo_root)
-    check("niche stats derived from bogota_leads.csv", len(stats) > 0)
-    ranked = rank_niches(repo_root)
+def test_niche_priority_runs_against_new_schema_csv(tmp_dir: Path):
+    data_dir = tmp_dir / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    lead = Lead(**_base_kwargs(business_name="Fixture Clinic", niche="Dermatologia laser"))
+    lead.set_decision_makers([_direct_person()])
+    run_qualification_gate(lead)
+    write_csv_mirror([lead], [], data_dir, run_id="fixture")
+    import shutil
+    shutil.move(str(data_dir / "qualified_leads_fixture.csv"), str(data_dir / "bogota_leads.csv"))
+
+    stats = load_niche_stats_from_repo(tmp_dir)
+    check("niche stats are derived from the new-schema bogota_leads.csv", len(stats) > 0)
+    key = next(iter(stats))
+    check("owner_identified_count reads real data instead of silently staying 0",
+          stats[key].owner_identified_count == 1)
+    check("owner_phone_count reads real data instead of silently staying 0",
+          stats[key].owner_phone_count == 1)
+
+    ranked = rank_niches(tmp_dir)
     check("niche ranking returns a sorted, non-empty list", len(ranked) > 0 and ranked[0][1] >= ranked[-1][1])
 
 
-def test_against_repo_dedupe():
-    """Optional deeper check: confirm dedupe.load_all_repo_sources runs cleanly
-    against the real repo CSVs without throwing, and actually loads records."""
-    repo_root = Path(__file__).resolve().parents[3]
-    from dedupe import load_all_repo_sources
-    records = load_all_repo_sources(repo_root)
-    check(f"repo CSVs load into dedupe fingerprints ({len(records)} records)", len(records) > 0)
+def test_cli_run_entrypoint_end_to_end(tmp_dir: Path):
+    """Regression for TWO real bugs the unit tests above never caught because
+    they call dedupe.py/report.py functions directly with correct arguments —
+    only actually invoking `cli.py run` (as the daily automation does)
+    exercised the wiring between them:
+      1. cmd_run called load_bogota_leads_decision_makers(repo_root) — the
+         directory — instead of repo_root/data/bogota_leads.csv, so it
+         crashed with IsADirectoryError on any real repo.
+      2. cmd_run called RunStats.from_qualified(qualified, qualified=len(...))
+         — a positional arg literally named the same as a kwarg — so it
+         crashed with 'multiple values for argument' on any run that reached
+         that line (i.e. every run, always).
+    Both were only caught by running the actual CLI against a real
+    repo-shaped directory, per the audit directive's 'no declares producción
+    sin verificarla'. This test runs cli.py as a subprocess end-to-end
+    against a fixture repo containing one already-known lead, and asserts:
+    the known lead dedupes correctly, a receptionist/GENERIC phone is
+    rejected from Qualified, and a multi-decision-maker candidate qualifies
+    on its primary while keeping the secondary."""
+    import json
+    import subprocess
+
+    repo_root = tmp_dir / "repo"
+    data_dir = repo_root / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    known = Lead(**_base_kwargs(business_name="Doctora Llanos Clínica de Piel", niche="Dermatologia laser"))
+    known.set_decision_makers([_direct_person(name="Lina María Llanos")])
+    run_qualification_gate(known)
+    write_csv_mirror([known], [], data_dir, run_id="seed")
+    import shutil
+    shutil.move(str(data_dir / "qualified_leads_seed.csv"), str(data_dir / "bogota_leads.csv"))
+    (data_dir / "known_bad_contacts.csv").write_text("domain,email\n", encoding="utf-8")
+    (data_dir / "sent_tracking.csv").write_text("recipient_email\n", encoding="utf-8")
+
+    candidates = [
+        {
+            "business_name": "Doctora Llanos Clínica de Piel", "niche": "Dermatologia laser",
+            "owner_name": "Lina María Llanos", "owner_phone": "+573108633793",
+            "owner_phone_source": "s", "owner_phone_evidence": "e", "owner_phone_confidence": "DIRECT",
+            "website_problem": "p", "website_evidence": "e",
+            "high_ticket_score": 8, "website_opportunity_score": 6, "data_quality_score": 8,
+        },
+        {
+            "business_name": "Estetica Generica SAS", "niche": "Dermatologia laser",
+            "owner_name": "Recepcion", "owner_phone": "+576015550199",
+            "owner_phone_source": "conmutador general", "owner_phone_evidence": "linea unica de agendamiento",
+            "owner_phone_confidence": "GENERIC",
+            "website_problem": "p", "website_evidence": "e",
+            "high_ticket_score": 7, "website_opportunity_score": 8, "data_quality_score": 6,
+        },
+        {
+            "business_name": "Centro Odontologico Sonrisa Real", "niche": "Implantes dentales",
+            "decision_makers": [
+                {"name": "Dr. Andres Forero", "role": "Socio fundador", "authority_level": "FINAL",
+                 "is_current": True, "phone": "+573154028871", "phone_confidence": "DIRECT",
+                 "phone_source": "Doctoralia", "phone_evidence": "wa.me enlazado a su perfil",
+                 "verification_status": "VERIFIED", "priority": 1},
+                {"name": "Dra. Marcela Uribe", "role": "Socia administrativa", "priority": 2},
+            ],
+            "website_problem": "p", "website_evidence": "e",
+            "high_ticket_score": 8.5, "website_opportunity_score": 7, "data_quality_score": 8.5,
+        },
+    ]
+    candidates_path = tmp_dir / "candidates.json"
+    candidates_path.write_text(json.dumps(candidates), encoding="utf-8")
+    out_dir = tmp_dir / "out"
+    cli_path = SCRIPTS_DIR / "cli.py"
+
+    result = subprocess.run(
+        [sys.executable, str(cli_path), "run", str(candidates_path),
+         "--repo-root", str(repo_root), "--niche", "test", "--out-dir", str(out_dir)],
+        capture_output=True, text=True,
+    )
+    check("cli.py run exits 0 against a real repo-shaped directory (not a crash)",
+          result.returncode == 0)
+    if result.returncode != 0:
+        print(result.stdout)
+        print(result.stderr)
+
+    qualified_csvs = list(out_dir.glob("qualified_leads_*.csv"))
+    check("a qualified CSV was written", len(qualified_csvs) == 1)
+    import csv as _csv
+    with open(qualified_csvs[0], newline="", encoding="utf-8") as f:
+        rows = list(_csv.DictReader(f))
+    names = {r["Business Name"] for r in rows}
+    check("the exact duplicate of an already-known lead is NOT re-qualified",
+          "Doctora Llanos Clínica de Piel" not in names)
+    check("a receptionist/GENERIC-phone-only business never reaches Qualified",
+          "Estetica Generica SAS" not in names)
+    check("the multi-decision-maker business qualifies on its primary",
+          "Centro Odontologico Sonrisa Real" in names)
+    sonrisa = next(r for r in rows if r["Business Name"] == "Centro Odontologico Sonrisa Real")
+    check("its qualified row keeps the secondary decision-maker, not just the primary",
+          "Marcela Uribe" in sonrisa["Secondary Decision Makers"])
+    check("'Doctora Llanos' duplicate is reported on stdout/stderr",
+          "Doctora Llanos" in (result.stdout + result.stderr))
 
 
 if __name__ == "__main__":
     import tempfile
+
+    test_e2e_single_decision_maker_qualifies()
+    test_e2e_multiple_decision_makers_preserved()
+    test_e2e_generic_and_verified_business_phone_never_qualify()
+    test_e2e_named_attribution_qualifies()
+    test_e2e_contradictory_sources_blocks_qualification()
+    test_e2e_no_website_still_qualifies_with_evidence()
+    test_e2e_multi_location_business()
+    test_e2e_former_founder_is_rejected()
+
+    test_phone_format_sanity_check()
+    test_invalid_confidence_enum_is_rejected()
+    test_decision_maker_reuse_is_flagged_not_dropped()
+
     test_normalization()
     test_dedupe_same_professional_different_names()
     test_gate_rejects_missing_owner_phone()
     test_gate_rejects_business_phone_relabeled_as_owner_phone()
-    test_gate_rejects_missing_owner_phone_confidence()
-    test_gate_accepts_fully_verified_vip_lead()
     test_unset_business_email_never_causes_false_duplicate()
     test_fuzzy_match_flags_without_dropping()
     test_validate_rejects_generic_source_and_vague_problem()
+
     with tempfile.TemporaryDirectory() as td:
         test_csv_output_roundtrip(Path(td))
-    try:
-        test_niche_priority_runs_against_repo()
-    except Exception as e:
-        print(f"[SKIP] test_niche_priority_runs_against_repo ({e})")
-    try:
-        test_against_repo_dedupe()
-    except Exception as e:  # repo CSVs may not be present in every context
-        print(f"[SKIP] test_against_repo_dedupe ({e})")
-    print("\nAll self-tests passed.")
+    with tempfile.TemporaryDirectory() as td2:
+        test_niche_priority_runs_against_new_schema_csv(Path(td2))
+    with tempfile.TemporaryDirectory() as td3:
+        test_cli_run_entrypoint_end_to_end(Path(td3))
+
+    print("\nAll self-tests passed (v3: multi-decision-maker + 5-tier confidence + Lead/Contact Quality split).")
