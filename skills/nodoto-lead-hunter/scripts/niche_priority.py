@@ -15,14 +15,14 @@ counts it can derive from bogota_leads.csv / the live Sheet.
 
 from __future__ import annotations
 import csv
+import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
-# Static business-value / urgency priors (0-10), one entry per niche in
-# docs/outreach_playbook.md section "PERFIL DEL LEAD IDEAL" / the 50-niche list.
-# Edit this table as NODOTO's own experience updates (e.g. after a niche closes
-# deals faster/slower than expected). Values are directional, not measured.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from schema import Lead  # noqa: E402
+
 NICHE_VALUE_PRIORS: dict[str, float] = {
     "cirujanos plasticos": 9.5, "dentistas cosmeticos": 8.0, "ortodoncistas": 7.5,
     "fertilidad": 9.0, "quiropracticos deportivos": 6.5, "perdida de peso medica": 7.5,
@@ -55,8 +55,7 @@ class NicheStats:
 
     @property
     def coverage_penalty(self) -> float:
-        """More existing leads in this niche -> lower remaining-opportunity score."""
-        return min(self.existing_leads / 20.0, 1.0)  # saturates at 20+ existing leads
+        return min(self.existing_leads / 20.0, 1.0)
 
     @property
     def website_gap_rate(self) -> float:
@@ -75,30 +74,28 @@ def _slugify_niche(value: str) -> str:
 
 
 def load_niche_stats_from_repo(repo_root: Path) -> dict[str, NicheStats]:
-    """Derives NicheStats from bogota_leads.csv (has Industry/Niche + Website
-    Problem columns already, no Owner columns yet -> owner_* stay at 0 until
-    the new Sheet/CSV output accumulates real owner data)."""
     stats: dict[str, NicheStats] = defaultdict(lambda: NicheStats(niche=""))
     path = repo_root / "data" / "bogota_leads.csv"
     if not path.exists():
         return stats
     with open(path, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
-            niche_raw = row.get("Industry/Niche", "") or "unknown"
+            lead = Lead.from_dict(row)
+            niche_raw = lead.niche or "unknown"
             key = _slugify_niche(niche_raw)
             s = stats[key]
             s.niche = niche_raw
             s.existing_leads += 1
-            problem = (row.get("Website Problem") or "").strip()
-            if problem and problem.upper() not in {"NONE", "N/A", "NOT_VERIFIED"}:
+            if lead.is_verified("website_problem"):
                 s.website_problem_count += 1
+            if lead.is_verified("owner_name"):
+                s.owner_identified_count += 1
+            if lead.is_verified("owner_phone"):
+                s.owner_phone_count += 1
     return dict(stats)
 
 
 def merge_sheet_owner_stats(stats: dict[str, NicheStats], sheet_rows: list[dict]) -> None:
-    """Fold in owner-identification / owner-phone counts from whatever is
-    already in the live Google Sheet (or its CSV mirror), keyed by the sheet's
-    own 'Niche' column."""
     for row in sheet_rows:
         key = _slugify_niche(row.get("Niche", ""))
         s = stats.setdefault(key, NicheStats(niche=row.get("Niche", "")))
@@ -111,12 +108,11 @@ def merge_sheet_owner_stats(stats: dict[str, NicheStats], sheet_rows: list[dict]
 
 
 def niche_opportunity_score(niche_key: str, stats: dict[str, NicheStats]) -> float:
-    """0-10. Higher = better niche to work next."""
-    value_prior = NICHE_VALUE_PRIORS.get(niche_key, 6.0)  # neutral default for unmapped niches
+    value_prior = NICHE_VALUE_PRIORS.get(niche_key, 6.0)
     s = stats.get(niche_key, NicheStats(niche=niche_key))
     remaining_opportunity = 1.0 - s.coverage_penalty
     website_gap = s.website_gap_rate
-    owner_access_gap = 1.0 - s.owner_access_rate  # more room = more owners still to find
+    owner_access_gap = 1.0 - s.owner_access_rate
 
     score = (
         value_prior * 0.40

@@ -19,17 +19,12 @@ from dataclasses import dataclass, field
 
 from schema import Lead
 
-# Sources too generic to count as "Owner Phone Source" — the source must name
-# WHERE specifically (e.g. "Instagram oficial @drname, bio destacada" is fine;
-# "Instagram", "internet", "Google" alone are not).
 _GENERIC_SOURCE_PATTERNS = [
     r"^internet$", r"^google$", r"^web$", r"^social media$", r"^redes sociales$",
     r"^instagram$", r"^facebook$", r"^linkedin$", r"^search$", r"^b[uú]squeda$",
     r"^unknown$", r"^varios$", r"^online$",
 ]
 
-# Website-problem phrasing too vague to be checkable (playbook rule #17: never
-# "Website is bad", always a specific, testable observation).
 _VAGUE_PROBLEM_PATTERNS = [
     r"^(the )?website is (bad|old|ugly|poor|weak)\.?$",
     r"^(el )?(sitio|website|pagina|página) (es|esta|está) (malo|mala|feo|anticuado|debil|débil)\.?$",
@@ -37,7 +32,12 @@ _VAGUE_PROBLEM_PATTERNS = [
     r"^mala presencia digital\.?$", r"^presencia web deficiente\.?$",
 ]
 
-MIN_EVIDENCE_LENGTH = 40  # characters; a real, specific observation is rarely shorter
+MIN_EVIDENCE_LENGTH = 40
+
+_GENERIC_EVIDENCE_PATTERNS = [
+    r"^confirmed\.?$", r"^verified\.?$", r"^confirmado\.?$", r"^verificado\.?$",
+    r"^yes\.?$", r"^s[ií]\.?$", r"^checked\.?$", r"^revisado\.?$",
+]
 
 
 @dataclass
@@ -87,5 +87,39 @@ def validate_evidence_quality(lead: Lead) -> ValidationResult:
 
     if lead.owner_name and lead.owner_name != "NOT_VERIFIED" and not lead.owner_role:
         errors.append("Owner Name is set but Owner Role is missing.")
+
+    if lead.owner_phone_evidence and lead.owner_phone_evidence != "NOT_VERIFIED":
+        if _matches_any(lead.owner_phone_evidence, _GENERIC_EVIDENCE_PATTERNS):
+            errors.append(
+                f"Owner Phone Evidence is a bare claim, not evidence: '{lead.owner_phone_evidence}'. "
+                "Describe what specifically proves this number belongs to this person (e.g. 'wa.me link "
+                "in the source of dr.perez's own Instagram bio, checked 2026-09-11')."
+            )
+        elif len(lead.owner_phone_evidence.strip()) < MIN_EVIDENCE_LENGTH:
+            warnings.append(
+                f"Owner Phone Evidence is short ({len(lead.owner_phone_evidence.strip())} chars) — "
+                "confirm it actually demonstrates the person<->number link, not just where it was seen."
+            )
+
+    if lead.owner_phone_discrepancy and lead.owner_phone_discrepancy.strip():
+        warnings.append(
+            f"Owner Phone Discrepancy is non-empty ('{lead.owner_phone_discrepancy}') — a lead with an "
+            "unresolved contradiction between sources should not be treated as fully clean even if it "
+            "otherwise passes the gate; double-check before outreach."
+        )
+
+    if lead.decision_maker_count > 1 and not lead.secondary_decision_makers_summary:
+        errors.append(
+            "Decision Maker Count > 1 but Secondary Decision Makers is empty — the secondary "
+            "decision-maker(s) were found but not recorded, which silently loses them."
+        )
+
+    for person in lead.decision_makers:
+        if person.phone_confidence in ("DIRECT", "NAMED_ATTRIBUTION") and person.phone_source and \
+                _matches_any(person.phone_source, _GENERIC_SOURCE_PATTERNS):
+            errors.append(
+                f"Decision maker '{person.name}' has confidence '{person.phone_confidence}' but a generic "
+                f"phone source ('{person.phone_source}') — confidence that high requires a specific source."
+            )
 
     return ValidationResult(ok=(len(errors) == 0), warnings=warnings, errors=errors)

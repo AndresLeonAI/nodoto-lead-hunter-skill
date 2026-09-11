@@ -23,9 +23,6 @@ from urllib.parse import urlparse
 
 from schema import Lead, NOT_VERIFIED_ALIASES
 
-# Below this, two normalized names are considered "close enough to review" but
-# NOT an automatic duplicate on their own (fuzzy match alone never silently
-# drops a lead — it only flags for a second look, per anti-fabrication caution).
 FUZZY_NAME_THRESHOLD = 0.87
 
 _STOPWORDS = {
@@ -45,7 +42,7 @@ def normalize_text(value: Optional[str]) -> str:
     value = value.lower()
     value = re.sub(r"[^a-z0-9\s]", " ", value)
     tokens = [t for t in value.split() if t and t not in _STOPWORDS]
-    return " ".join(sorted(tokens))  # order-insensitive, e.g. "Laser Center Juan" == "Juan Laser Center"
+    return " ".join(sorted(tokens))
 
 
 def normalize_phone(value: Optional[str]) -> str:
@@ -55,8 +52,6 @@ def normalize_phone(value: Optional[str]) -> str:
     if value.upper() in NOT_VERIFIED_ALIASES:
         return ""
     digits = re.sub(r"\D", "", value)
-    # Normalize Colombian numbers: drop leading country code / trunk prefix so
-    # "+57 601 555 1234", "601 555 1234" and "6015551234" all collapse to one key.
     if digits.startswith("57") and len(digits) > 10:
         digits = digits[2:]
     return digits.lstrip("0")
@@ -86,8 +81,6 @@ def normalize_handle(value: Optional[str]) -> str:
 
 @dataclass
 class ExistingRecord:
-    """Minimal normalized fingerprint of a row already present somewhere
-    (Sheet, bogota_leads.csv, sent_tracking.csv, known_bad_contacts.csv)."""
     source: str
     business_key: str = ""
     owner_key: str = ""
@@ -120,24 +113,42 @@ def fingerprint_lead(lead: Lead, source: str = "candidate") -> ExistingRecord:
     )
 
 
+def fingerprint_all_decision_makers(lead: Lead, source: str = "candidate") -> list[ExistingRecord]:
+    records = []
+    for person in lead.decision_makers:
+        phone_key = normalize_phone(person.phone)
+        owner_key = normalize_text(person.name)
+        if not phone_key and not owner_key:
+            continue
+        records.append(ExistingRecord(
+            source=f"{source}:decision_maker",
+            business_key=normalize_text(lead.business_name),
+            owner_key=owner_key,
+            phone_key=phone_key,
+            raw_name=f"{person.name} ({lead.business_name})",
+        ))
+    return records
+
+
 def load_bogota_leads_csv(path: Path) -> list[ExistingRecord]:
-    """bogota_leads.csv header:
-    #,Business Name,Industry/Niche,Bogota Location,Website,Website Problem,
-    Business Email,Evidence/Source,Why High-Ticket Prospect,Lead Score
-    """
     records = []
     if not path.exists():
         return records
     with open(path, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
-            records.append(ExistingRecord(
-                source="bogota_leads.csv",
-                business_key=normalize_text(row.get("Business Name")),
-                phone_key="",
-                domain_key=normalize_domain(row.get("Website")),
-                email=normalize_email(row.get("Business Email")),
-                raw_name=row.get("Business Name", ""),
-            ))
+            lead = Lead.from_dict(row)
+            records.append(fingerprint_lead(lead, source="bogota_leads.csv"))
+    return records
+
+
+def load_bogota_leads_decision_makers(path: Path) -> list[ExistingRecord]:
+    records = []
+    if not path.exists():
+        return records
+    with open(path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            lead = Lead.from_dict(row)
+            records += fingerprint_all_decision_makers(lead, source="bogota_leads.csv")
     return records
 
 
@@ -156,8 +167,6 @@ def load_known_bad_contacts_csv(path: Path) -> list[ExistingRecord]:
 
 
 def load_sheet_rows(rows: Iterable[dict]) -> list[ExistingRecord]:
-    """rows: list of dicts keyed by the canonical schema.COLUMNS header (or whatever
-    header the live sheet actually uses, already mapped by sheets_io)."""
     records = []
     for row in rows:
         lead = Lead.from_dict(row)
@@ -166,10 +175,6 @@ def load_sheet_rows(rows: Iterable[dict]) -> list[ExistingRecord]:
 
 
 def find_duplicate(lead: Lead, existing: list[ExistingRecord]) -> Optional[ExistingRecord]:
-    """Returns the first existing record that plausibly refers to the same
-    business/owner, or None. Matches on any single strong signal:
-    exact phone match, exact domain match, exact email match, exact IG handle
-    match, or a normalized business-name/owner-name match."""
     fp = fingerprint_lead(lead)
     for rec in existing:
         if fp.phone_key and rec.phone_key and fp.phone_key == rec.phone_key:
@@ -189,10 +194,6 @@ def find_duplicate(lead: Lead, existing: list[ExistingRecord]) -> Optional[Exist
 
 def find_fuzzy_candidates(lead: Lead, existing: list[ExistingRecord],
                            threshold: float = FUZZY_NAME_THRESHOLD) -> list[tuple[ExistingRecord, float]]:
-    """Near-miss name matches that `find_duplicate` would NOT catch (typos,
-    partial renames, e.g. 'Centro Dermatologico Bogota' vs 'Centro
-    Dermatologico de Bogota SAS'). Returned for human/agent review, not
-    auto-dropped — a fuzzy match alone is not proof of duplication."""
     fp = fingerprint_lead(lead)
     hits = []
     for rec in existing:
@@ -207,11 +208,23 @@ def find_fuzzy_candidates(lead: Lead, existing: list[ExistingRecord],
     return hits
 
 
+def find_decision_maker_reuse(lead: Lead, existing_dm_records: list[ExistingRecord]) -> list[ExistingRecord]:
+    hits = []
+    for person in lead.decision_makers:
+        phone_key = normalize_phone(person.phone)
+        owner_key = normalize_text(person.name)
+        for rec in existing_dm_records:
+            same_phone = phone_key and rec.phone_key and phone_key == rec.phone_key
+            same_name = owner_key and rec.owner_key and owner_key == rec.owner_key
+            if (same_phone or same_name) and normalize_text(lead.business_name) != rec.business_key:
+                hits.append(rec)
+    return hits
+
+
 def load_all_repo_sources(repo_root: Path) -> list[ExistingRecord]:
     records = []
     records += load_bogota_leads_csv(repo_root / "data" / "bogota_leads.csv")
     records += load_known_bad_contacts_csv(repo_root / "data" / "known_bad_contacts.csv")
-    # sent_tracking.csv only has recipient_email; folded in via a lightweight pass.
     sent_path = repo_root / "data" / "sent_tracking.csv"
     if sent_path.exists():
         with open(sent_path, newline="", encoding="utf-8") as f:

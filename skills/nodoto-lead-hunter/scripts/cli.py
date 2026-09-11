@@ -38,12 +38,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from schema import Lead, QUALIFICATION_STATUS_QUALIFIED, QUALIFICATION_STATUS_OWNER_PHONE_MISSING  # noqa: E402
-from dedupe import load_all_repo_sources, load_sheet_rows, find_duplicate, find_fuzzy_candidates  # noqa: E402
+from schema import Lead, VALID_OWNER_PHONE_CONFIDENCE, QUALIFICATION_STATUS_QUALIFIED, QUALIFICATION_STATUS_OWNER_PHONE_MISSING  # noqa: E402
+from dedupe import (  # noqa: E402
+    load_all_repo_sources, load_bogota_leads_decision_makers, load_sheet_rows,
+    find_duplicate, find_fuzzy_candidates, find_decision_maker_reuse,
+)
 from scoring import run_qualification_gate  # noqa: E402
 from validate import validate_evidence_quality  # noqa: E402
 from sheets_io import write_csv_mirror  # noqa: E402
-from report import RunStats, render_report  # noqa: E402
+from report import RunStats, render_report, build_clean_export_table, CLEAN_EXPORT_HEADERS  # noqa: E402
 from niche_priority import rank_niches  # noqa: E402
 
 
@@ -59,9 +62,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         sheet_rows = json.loads(Path(args.sheet_rows).read_text(encoding="utf-8"))
 
     existing = load_all_repo_sources(repo_root) + load_sheet_rows(sheet_rows)
+    existing_decision_makers = load_bogota_leads_decision_makers(repo_root / "data" / "bogota_leads.csv")
 
     qualified, owner_missing, discarded, duplicates = [], [], [], []
     investigated = 0
+    decision_maker_reuse_flags = 0
 
     for raw in candidates_raw:
         investigated += 1
@@ -77,6 +82,13 @@ def cmd_run(args: argparse.Namespace) -> int:
                   f"({fuzzy_hits[0][1]:.0%}) against '{fuzzy_hits[0][0].raw_name or fuzzy_hits[0][0].source}' "
                   f"— not auto-dropped, verify manually.", file=sys.stderr)
 
+        reuse_hits = find_decision_maker_reuse(lead, existing_decision_makers)
+        if reuse_hits:
+            decision_maker_reuse_flags += 1
+            print(f"[REVIEW] A decision-maker on '{lead.business_name}' also appears on "
+                  f"'{reuse_hits[0].raw_name}' — could be the same person running two businesses, "
+                  f"or a research mistake. Not auto-dropped, verify.", file=sys.stderr)
+
         gate = run_qualification_gate(lead)
         if gate.status == QUALIFICATION_STATUS_OWNER_PHONE_MISSING:
             owner_missing.append(lead)
@@ -90,12 +102,11 @@ def cmd_run(args: argparse.Namespace) -> int:
             discarded.append((lead, quality.errors))
             continue
 
-        # A qualified lead's own fingerprint joins `existing` immediately so two
-        # near-identical candidates in the SAME batch can't both slip through.
         existing.append(_fingerprint(lead))
         qualified.append(lead)
 
-    stats = RunStats(
+    stats = RunStats.from_qualified(
+        qualified,
         niche=args.niche or "(no especificado)",
         candidates_found=len(candidates_raw),
         investigated=investigated,
@@ -106,13 +117,15 @@ def cmd_run(args: argparse.Namespace) -> int:
         tier_b=sum(1 for l in qualified if l.lead_tier == "B"),
         owner_identified=sum(1 for l in qualified + owner_missing if l.is_verified("owner_name")),
         owner_identified_of=len(qualified) + len(owner_missing),
-        owner_phone_verified=len(qualified),
+        owner_phone_verified=sum(1 for l in qualified + owner_missing
+                                  if (l.owner_phone_confidence or "").upper() in VALID_OWNER_PHONE_CONFIDENCE),
         owner_phone_verified_of=len(qualified) + len(owner_missing),
         website_audited=sum(1 for l in qualified if l.is_verified("website_problem") or l.website_status != "NOT_VERIFIED"),
         website_audited_of=len(qualified),
         instagram_found=sum(1 for l in qualified if l.is_verified("instagram") or l.is_verified("owner_instagram")),
         instagram_found_of=len(qualified),
         duplicates=len(duplicates),
+        decision_maker_reuse_flags=decision_maker_reuse_flags,
     )
 
     out_dir = Path(args.out_dir)
@@ -120,6 +133,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     stats.csv_paths = paths
 
     print(render_report(stats))
+
+    if qualified:
+        clean_path = out_dir / f"clean_export_{Path(paths['qualified_csv']).stem.split('_', 2)[-1]}.csv"
+        _write_clean_export(clean_path, qualified)
+        print(f"\nExportacion limpia (tabla de una fila por lead): {clean_path}", file=sys.stderr)
 
     if discarded:
         print("\n--- DISCARDED (reasons) ---", file=sys.stderr)
@@ -131,6 +149,15 @@ def cmd_run(args: argparse.Namespace) -> int:
             print(f"- {lead.business_name} matches existing record from {rec.source}", file=sys.stderr)
 
     return 0
+
+
+def _write_clean_export(path: Path, qualified: list[Lead]) -> None:
+    import csv as _csv
+    rows = build_clean_export_table(qualified)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = _csv.DictWriter(f, fieldnames=CLEAN_EXPORT_HEADERS)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def _fingerprint(lead: Lead):
