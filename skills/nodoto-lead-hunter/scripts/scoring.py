@@ -16,7 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from schema import (
-    Lead, REQUIRED_FOR_QUALIFIED, NOT_VERIFIED,
+    Lead, REQUIRED_FOR_QUALIFIED, NOT_VERIFIED, VALID_OWNER_PHONE_CONFIDENCE,
     QUALIFICATION_STATUS_QUALIFIED, QUALIFICATION_STATUS_OWNER_PHONE_MISSING,
     QUALIFICATION_STATUS_DISCARDED,
 )
@@ -50,6 +50,13 @@ def owner_phone_is_verified(lead: Lead) -> bool:
     if not lead.is_verified("owner_phone"):
         return False
     if not lead.is_verified("owner_phone_source"):
+        return False
+    # Hard rule (v2): the confidence tier is mandatory and must be one that
+    # specifically ties the number to the decision-maker, not the front desk /
+    # generic business line / WhatsApp Business menu. See the memory repo's
+    # docs/owner_phone_sources.md for the DIRECT / NAMED_ATTRIBUTION definitions.
+    confidence = (lead.owner_phone_confidence or "").strip().upper()
+    if confidence not in VALID_OWNER_PHONE_CONFIDENCE:
         return False
     # Hard rule: never accept the business phone silently relabeled as the owner phone.
     if lead.is_verified("business_phone") and lead.owner_phone.strip() == lead.business_phone.strip():
