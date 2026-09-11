@@ -77,6 +77,50 @@ description: High-ticket sales opportunity engine for NODOTO AGENCY. Discovers B
 > completo (`DecisionMaker`, `Lead`) y `tests/test_pipeline.py` para los 8
 > escenarios E2E obligatorios que este diseño debe pasar siempre.
 
+> ## ACTUALIZACIÓN v3.1 (2026-09-11) — auditoría de eficiencia, BigQuery + Clay
+>
+> Segunda pasada de auditoría, esta vez enfocada en **eficiencia** (llegar a
+> 30-50 leads extremadamente calificados/día de forma consistente, no solo
+> correcta). Se investigó si Google BigQuery y Clay (ambos conectados vía
+> Composio) debían incorporarse al pipeline. Resultado y cambios reales:
+>
+> 1. **BigQuery: investigado, NO adoptado como dependencia.** La cuenta
+>    conectada solo tiene proyectos genéricos sin relación con NODOTO ("My
+>    First Project", "PRUEBA", etc.) — no existe ningún warehouse de leads que
+>    aprovechar. Al volumen actual (cientos de filas en `bogota_leads.csv`),
+>    parsear CSVs es instantáneo; añadir BigQuery ahora solo introduciría una
+>    segunda fuente de verdad que puede desincronizarse de GitHub, exactamente
+>    el tipo de riesgo que esta auditoría existe para eliminar, sin mejorar en
+>    nada la calidad real de un lead (BigQuery no investiga negocios ni
+>    verifica teléfonos). **No usar BigQuery en este pipeline hasta que
+>    `bogota_leads.csv` supere ~5,000-10,000 filas y el dedupe fuzzy
+>    (`difflib`, O(n²) por corrida) sea un cuello de botella medible** — y aun
+>    entonces, como un índice espejo de solo lectura, nunca como reemplazo de
+>    GitHub como fuente de verdad append-only.
+> 2. **El verdadero apalancamiento de eficiencia era el dimensionamiento del
+>    embudo, no infraestructura nueva.** Se implementó
+>    `niche_priority.estimate_raw_candidates_needed()`: usa el
+>    `owner_access_rate` histórico real de cada nicho (ya calculado desde
+>    `bogota_leads.csv`) para decir cuántos candidatos crudos descubrir hoy
+>    para tener una oportunidad real de alcanzar el target de calificados —
+>    nichos donde el teléfono del decisor históricamente es difícil de
+>    encontrar necesitan un embudo más grande, no el mismo 20-40 fijo de
+>    siempre. Ver `python3 scripts/cli.py rank-niches --target-qualified <n>`.
+> 3. **Escalamiento en paralelo, formalizado en la skill (antes solo vivía en
+>    el prompt de la tarea programada).** Ver la nueva sección "Escalamiento
+>    en paralelo" más abajo — descubrir en 2-4 nichos a la vez, investigar en
+>    lotes paralelos de 15-20 vía sub-agentes, consolidar en un solo JSON,
+>    UNA sola llamada a `cli.py run` al final.
+> 4. **Clay: disponible, nunca dependencia — solo cuando de verdad se
+>    requiere.** Ver "Enriquecimiento opcional con Clay" más abajo. Se usa
+>    ÚNICAMENTE como respaldo puntual de descubrimiento de teléfono/email tras
+>    agotar las fuentes públicas gratuitas de `owner_phone_sources_v3.md`, y
+>    solo para negocios que ya pasarían el filtro de Lead Quality por sí
+>    solos. Cualquier dato que devuelva Clay pasa por la MISMA verificación de
+>    evidencia que cualquier otra fuente — nunca se eleva automáticamente a
+>    DIRECT/NAMED_ATTRIBUTION solo porque vino de Clay. Si Clay no está
+>    disponible, la corrida sigue exactamente igual sin él.
+
 # NODOTO LEAD HUNTER
 
 A high-ticket sales opportunity engine, not a generic scraper. It exists to answer
@@ -121,10 +165,13 @@ unless there's explicit evidence the owner personally publishes that same number
 ## Pipeline
 
 ```
-READ REPO → READ GOOGLE SHEET → SELECT NICHE (opportunity score) →
-DISCOVER (20-40 candidates, one niche only) → RESEARCH →
-IDENTIFY OWNER → FIND OWNER PHONE → AUDIT WEBSITE → FIND SOCIALS →
-SCORE + GATE → DEDUPE (repo + sheet) → WRITE (append-only) → READ BACK → VERIFY
+READ REPO → READ GOOGLE SHEET → SELECT NICHE(S) (opportunity score,
+sized per niche via estimate_raw_candidates_needed) →
+DISCOVER (2-4 niches in parallel if targeting 30-50/day) → RESEARCH
+(parallel sub-agent batches of 15-20) → IDENTIFY DECISION-MAKER(S) →
+FIND DECISION-MAKER PHONE (Clay only as last-resort fallback) →
+AUDIT WEBSITE → FIND SOCIALS → SCORE + GATE → DEDUPE (repo + sheet) →
+WRITE (append-only, one consolidated cli.py run) → READ BACK → VERIFY
 ```
 
 ### 0. Read repo + read Sheet
@@ -151,6 +198,46 @@ owner phone, competition, and ease of reaching a decision-maker. Favor
 HIGH TICKET + WEBSITE GAP + LOW COVERAGE + OWNER ACCESS. Cross-reference
 against `bogota_leads.csv`'s `Niche` column and the Sheet's `Niche`
 column to see what's already saturated. Do not mix niches within a run.
+
+Size the raw discovery batch to the niche instead of guessing 20-40 every
+time:
+
+```bash
+python3 skills/nodoto-lead-hunter/scripts/cli.py rank-niches --repo-root . --target-qualified 10
+```
+
+The `Raw needed` column comes from `niche_priority.estimate_raw_candidates_needed()`
+— it uses the niche's real historical `owner_access_rate` (how often a
+decision-maker phone was actually found there before) to say how many
+candidates to discover today for a realistic shot at the target. A niche
+with no history yet defaults to a conservative 12% assumed qualify rate
+(over-discover rather than run short); the number is floored at 2x the
+target and capped at 12x (past that, work a second niche in parallel instead
+of over-mining one — see "Escalamiento en paralelo" below).
+
+### 1.5 Escalamiento en paralelo (para llegar a 30-50/día de forma confiable)
+
+Un solo nicho de 20-40 candidatos rara vez produce 30-50 calificados —
+la meta operativa se alcanza combinando varios nichos por día:
+
+1. Elegir 2-4 nichos del ranking (paso 1), priorizando los de mayor Niche
+   Opportunity Score primero.
+2. Descubrir el volumen crudo recomendado por nicho (paso 1) — típicamente
+   100-150 candidatos totales entre todos los nichos elegidos.
+3. Dividir la investigación (pasos 3-6: decisores, teléfono, sitio, redes) en
+   lotes de 15-20 candidatos y correrlos en **sub-agentes en paralelo** (uno
+   por lote) — cada sub-agente entrega su lote como una lista de objetos con
+   el mismo shape que `Lead`/`DecisionMaker` (ver `tests/candidates_sample.json`).
+4. Consolidar TODOS los lotes de TODOS los nichos en un solo archivo JSON
+   antes de tocar `cli.py`. Nunca correr `cli.py run` una vez por lote —
+   fragmenta el dedupe (dos lotes distintos no se ven entre sí hasta que
+   comparten una sola llamada) y produce múltiples reportes en vez de uno.
+5. Una sola llamada final: `cli.py run candidatos_consolidados.json --niche
+   "<nichos trabajados hoy, separados por coma>" ...`.
+
+Esto es exactamente lo que ya hace la tarea programada diaria (ver el prompt
+del scheduled task) — esta sección lo deja disponible también para
+corridas manuales de la skill, no solo para la automatización.
 
 ### 2. Discover (20-40 candidates)
 
@@ -185,6 +272,38 @@ Record `Owner Phone Source` with enough specificity to audit later (e.g.
 `Owner Phone Evidence` describing HOW the person↔number link was proven, not
 just where it was seen. See `docs/owner_phone_sources_v3.md` in the memory
 repo for the full 5-tier hierarchy and contradiction-handling protocol.
+
+#### 4b. Enriquecimiento opcional con Clay (respaldo, nunca dependencia)
+
+Clay (`clay_mcp` en Composio) está conectado y disponible, pero el pipeline
+**nunca depende de él** — si no está conectado o falla, la corrida sigue
+exactamente igual usando solo fuentes públicas. Se invoca únicamente cuando
+las TRES condiciones se cumplen:
+
+1. Se agotaron las fuentes públicas gratuitas de `owner_phone_sources_v3.md`
+   para el decisor de mayor prioridad (`priority=1`) — Clay nunca reemplaza
+   la búsqueda pública, solo la sigue.
+2. El negocio ya calificaría por Lead Quality (ticket alto + gap de sitio
+   real) independientemente del contacto — nunca gastar créditos de Clay en
+   un negocio que de todas formas no calificaría.
+3. Existe un dominio propio o página de LinkedIn de la empresa identificable
+   (las herramientas de Clay buscan contactos por dominio/URL de LinkedIn de
+   la empresa, no por nombre de negocio suelto — muchos consultorios/estudios
+   pequeños en Bogotá no tienen esto, y ahí Clay simplemente no aplica).
+
+Herramientas a usar, en este orden: `CLAY_MCP_FIND_AND_ENRICH_LIST_OF_CONTACTS`
+si ya se conoce el nombre del decisor (busca su teléfono/email directo), o
+`CLAY_MCP_RUN_SUBROUTINE_DIRECT` con la subrutina "Enrich Person and Find
+Contact Details" / "Work Email" si solo se conoce el negocio. **Regla que no
+se negocia:** cualquier teléfono/email que devuelva Clay entra al pipeline
+como un CANDIDATO a verificar, no como un hecho verificado — pasa por el
+mismo paso 6 (verificación con evidencia citable) y el mismo cross-check que
+cualquier otra fuente. Clay nunca produce por sí solo `phone_confidence =
+DIRECT` o `NAMED_ATTRIBUTION`; el tier final depende de si la evidencia
+recolectada (idealmente cruzada contra una fuente pública independiente)
+sostiene ese nivel. Registrar `phone_source` como algo auditable, ej.
+"Clay (Enrich Person) — cruzado contra perfil de LinkedIn personal
+verificado", nunca solo "Clay".
 
 ### 5. Website audit (visit it for real)
 
@@ -331,11 +450,12 @@ fields automatically from the qualified leads.
 
 ## Batching target
 
-Discover 20-40+ per niche (more than one niche per day if needed to reach the
-target), research all, expect real attrition. Target **30-50 truly qualified
-leads per day** — but quality over quantity always: if only 12 are genuinely
-good, deliver 12, never pad the batch with weak leads or estimated/invented
-phone numbers to hit a round number.
+Size the raw batch per niche with `cli.py rank-niches --target-qualified <n>`
+(see "Escalamiento en paralelo" above) instead of a fixed 20-40 — typically
+2-4 niches, 100-150 raw candidates combined, researched in parallel batches.
+Target **30-50 truly qualified leads per day** — but quality over quantity
+always: if only 12 are genuinely good, deliver 12, never pad the batch with
+weak leads or estimated/invented phone numbers to hit a round number.
 
 ## Anti-fabrication (inherited, non-negotiable)
 
@@ -370,7 +490,9 @@ entry, not mixed into the cold-email run log.
   sources/evidence, vague website-problem text, unrecorded secondary
   decision-makers).
 - `scripts/niche_priority.py` — Niche Opportunity Score ranking from real
-  repo/Sheet coverage data.
+  repo/Sheet coverage data, plus `estimate_raw_candidates_needed()` (v3.1) for
+  sizing the raw discovery batch per niche from its real historical
+  owner-access rate.
 - `scripts/sheets_io.py` — Sheets write-plan/verify contract + CSV fallback writer.
 - `scripts/report.py` — fixed-format run report + the exact one-row-per-lead
   clean export table.
@@ -380,8 +502,9 @@ entry, not mixed into the cold-email run log.
 - `tests/test_pipeline.py` — the 8 mandated E2E scenarios (single/multi
   decision-maker, generic/verified-business-only phone rejection,
   named-attribution, contradictory sources, no-website, multi-location,
-  former-founder), anti-hallucination checks, decision-maker-reuse, and a
-  subprocess-level test of `cli.py run` itself (the only thing that caught
-  two real production bugs in this skill's own wiring). Run after any change:
+  former-founder), anti-hallucination checks, decision-maker-reuse, the
+  funnel-sizing helper (v3.1), and a subprocess-level test of `cli.py run`
+  itself (the only thing that caught two real production bugs in this
+  skill's own wiring). Run after any change:
   `python3 skills/nodoto-lead-hunter/tests/test_pipeline.py`.
 - `tests/candidates_sample.json` — example input shape for `cli.py run`.
