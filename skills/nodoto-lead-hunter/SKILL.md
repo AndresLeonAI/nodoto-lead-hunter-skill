@@ -1,24 +1,81 @@
 ---
 name: nodoto-lead-hunter
-description: High-ticket sales opportunity engine for NODOTO AGENCY. Discovers Bogotá businesses in one niche at a time with weak digital presence, identifies the owner/decision-maker and their publicly-verifiable professional phone, audits the real website, scores and dedupes the result, and writes only fully-qualified leads to the NODOTO Google Sheet via Composio (with an automatic CSV fallback/mirror). Use when asked to find leads, prospect, hunt for clients, or run lead generation for NODOTO.
+description: High-ticket sales opportunity engine for NODOTO AGENCY. Discovers Bogotá businesses in one niche at a time with weak digital presence, identifies EVERY plausible decision-maker (not just one), verifies the DECISION-MAKER'S OWN phone (never the receptionist's) at one of 5 confidence tiers, audits the real website, scores Lead Quality and Contact Quality separately, dedupes against persistent GitHub memory, and writes only fully-qualified leads to CSV/Sheets. Use when asked to find leads, prospect, hunt for clients, or run lead generation for NODOTO.
 ---
 
-> **ACTUALIZACION v2 (obligatoria, lee esto primero):** este proceso quedo
-> reemplazado/complementado por la metodologia en
-> [nodoto-lead-hunter-memory](https://github.com/AndresLeonAI/nodoto-lead-hunter-memory):
-> `docs/methodology_v2.md` (descubrimiento estructurado via Google Maps,
-> escalamiento a 30-50 calificados/dia, senales reales de facturacion, rama
-> para negocios sin sitio web) y `docs/owner_phone_sources.md` (la unica
-> fuente valida para identificar el telefono del TOMADOR DE DECISION, nunca
-> el de recepcion/conmutador — reemplaza cualquier instruccion equivalente
-> mas abajo en este archivo). El schema (`schema.py`) ahora exige un campo
-> `Owner Phone Confidence` (`DIRECT` / `NAMED_ATTRIBUTION`) para que un
-> lead pueda calificar — ver ese repo antes de correr cualquier corrida,
-> manual o programada. Ese repo tambien es la memoria persistente
-> (`data/bogota_leads.csv`, etc.): leela antes de investigar y escribele al
-> terminar, en vez de asumir que este repo tiene el historial.
-
-
+> ## ACTUALIZACIÓN v3 (2026-09-11) — leer esto primero
+>
+> Esta skill fue auditada de forma adversarial (buscando activamente números de
+> recepcionista mal etiquetados como del dueño, decisores desactualizados,
+> negocios con varios socios tratados como si solo tuvieran uno, y alucinación
+> de datos) y reescrita para cerrar cada hueco encontrado. Lo que sigue debajo
+> de esta nota es la v2 original y sigue siendo válido en su mayoría (fuentes
+> públicas legítimas, principio de "nunca inventar"), pero estas reglas v3 lo
+> **reemplazan** donde haya conflicto:
+>
+> 1. **Nunca asumas un solo decisor.** Toda investigación debe intentar
+>    encontrar TODOS los decisores plausibles (socios, codirectores, gerente
+>    administrativo con poder de compra) y registrarlos en
+>    `decision_makers` (lista completa, ordenada por prioridad). El primero
+>    (`priority=1`) es el que se prioriza para contacto — los demás NUNCA se
+>    descartan, quedan en `Secondary Decision Makers`.
+> 2. **Confianza del teléfono: 5 niveles, no 2** — `schema.py`:
+>    `DIRECT` (el propio decisor lo publica) · `NAMED_ATTRIBUTION` (fuente
+>    pública nombra explícitamente a esa persona con ese número — directorio
+>    profesional, prensa, Doctoralia) · `VERIFIED_BUSINESS` (número real y
+>    correcto del NEGOCIO, pero explícitamente NO del decisor — nunca lo
+>    tratable como owner phone) · `GENERIC` (conmutador/recepción/menú de
+>    WhatsApp Business) · `UNKNOWN` (no encontrado). Solo `DIRECT` y
+>    `NAMED_ATTRIBUTION` pueden calificar un lead.
+> 3. **Pipeline de descubrimiento, en este orden exacto — nunca puntuar antes
+>    de tener el contacto:**
+>    `DESCUBRIR → IDENTIFICAR NEGOCIO → IDENTIFICAR DECISORES → PRIORIZAR
+>    DECISOR → BUSCAR TELÉFONO → VERIFICAR → CROSS-CHECK → SCORE →
+>    DEDUPLICAR → MEMORIA → EXPORTAR`.
+> 4. **Verificación de cada teléfono candidato:** identificar la persona →
+>    su rol/autoridad → el número → probar el vínculo persona↔número con
+>    evidencia citable → cross-check contra otra fuente si es posible →
+>    registrar la evidencia en `phone_evidence` → asignar el tier de
+>    confianza. Si dos fuentes se contradicen, NUNCA elegir arbitrariamente:
+>    compara autoridad/antigüedad de cada fuente, registra el desacuerdo en
+>    `phone_discrepancy`, y usa `verification_status=CONTRADICTED` — eso
+>    bloquea la calificación hasta resolverlo, no importa qué tan alta sea
+>    la confianza declarada.
+> 5. **Un decisor que ya no es el decisor** (vendió, se retiró, ya no
+>    aparece activo) se marca `is_current=False` — bloquea la calificación
+>    aunque su teléfono sea DIRECT y esté perfectamente verificado.
+> 6. **Lead Quality ≠ Contact Quality.** Lead Quality = qué tan buen negocio
+>    es esta oportunidad (ticket, necesidad, gap digital) — nunca usa
+>    señales de contacto. Contact Quality = qué tan alcanzable es el decisor
+>    real — un teléfono GENERIC nunca puede puntuar igual que uno DIRECT
+>    verificado, sin importar cuán bueno sea el negocio. Ver `scoring.py`.
+> 7. **Fuentes públicas legítimas únicamente** (ampliando la lista v2 de
+>    abajo): sitio oficial, perfil profesional propio, Instagram/Facebook/
+>    LinkedIn PERSONAL (no solo la página del negocio), WhatsApp/wa.me
+>    publicado públicamente, RUES/Cámara de Comercio de Bogotá (representante
+>    legal), RETHUS/Tribunal Nacional de Ética Médica y colegios
+>    profesionales (abogados, contadores), Doctoralia, prensa/entrevistas/
+>    podcasts/eventos públicos. **Nunca** datos privados, comprados, o
+>    inferidos/adivinados.
+> 8. **Formato de salida limpio** (una fila = respuesta completa): `Empresa |
+>    Decisor principal | Otros decisores | Teléfono decisor | Confidence |
+>    Web | Problema | Redes | Ángulo | Notas` — generado automáticamente por
+>    `report.build_clean_export_table()`, nunca a mano.
+> 9. **Meta operativa: 30-50 leads extremadamente calificados/día — pero
+>    calidad sobre cantidad.** Si un día solo hay 12 que de verdad califican,
+>    se entregan 12. Nunca se rellena con leads débiles ni teléfonos
+>    inventados/estimados para llegar al número.
+> 10. **Memoria persistente en GitHub** (`AndresLeonAI/nodoto-lead-hunter-memory`,
+>    repo `data/` y `docs/`) es la fuente de verdad entre corridas — leer
+>    ANTES de investigar (para no repetir trabajo ni re-contactar leads
+>    descartados/enviados) y escribir DESPUÉS (append-only, nunca sobrescribir
+>    filas existentes) cada lead, descarte, teléfono rechazado, fuente mala,
+>    decisor, nicho trabajado, error y aprendizaje de la corrida.
+>
+> Ejecución mecánica (dedupe, gate, scoring, export) vive en
+> `scripts/cli.py run` — ver `scripts/schema.py` para el modelo de datos
+> completo (`DecisionMaker`, `Lead`) y `tests/test_pipeline.py` para los 8
+> escenarios E2E obligatorios que este diseño debe pasar siempre.
 
 # NODOTO LEAD HUNTER
 
@@ -92,7 +149,7 @@ economic potential, urgency, existing lead count for that niche (fewer = more
 room), % with a bad/missing website, % with an identified owner, % with an
 owner phone, competition, and ease of reaching a decision-maker. Favor
 HIGH TICKET + WEBSITE GAP + LOW COVERAGE + OWNER ACCESS. Cross-reference
-against `bogota_leads.csv`'s `Industry/Niche` column and the Sheet's `Niche`
+against `bogota_leads.csv`'s `Niche` column and the Sheet's `Niche`
 column to see what's already saturated. Do not mix niches within a run.
 
 ### 2. Discover (20-40 candidates)
@@ -102,24 +159,32 @@ matching the high-ticket profile in `docs/outreach_playbook.md` section 1 and
 respecting its exclusions (section 2). Real businesses only — no invented
 names, no invented addresses.
 
-### 3. Research + owner discovery engine
+### 3. Research + decision-maker discovery engine (v3: find ALL of them)
 
 For each candidate, go beyond the Maps listing. Search:
-`"<business>" owner`, `"<business>" fundador`, `"<business>" director`,
-`"<business>" Dr.`, `"<business>" LinkedIn`, `site:linkedin.com "<business>"`,
-`site:instagram.com "<business>"`. Objective: business → decision-maker.
-Roles to look for: Owner, Founder, Co-Founder, Partner, Managing Partner,
-Director, lead Doctor/Professional, CEO, Principal, Administrador/propietario.
+`"<business>" owner`, `"<business>" fundador`, `"<business>" socio`,
+`"<business>" director`, `"<business>" Dr.`, `"<business>" LinkedIn`,
+`site:linkedin.com "<business>"`, `site:instagram.com "<business>"`.
+Objective: business → EVERY plausible decision-maker, not just the first name
+found. Roles to look for: Owner, Founder, Co-Founder, Partner, Managing
+Partner, Director, lead Doctor/Professional, CEO, Principal,
+Administrador/propietario. Record each as a `DecisionMaker` in
+`decision_makers`, then rank by `priority` (see the v3 note above) — never
+collapse a multi-partner business into a single name.
 
-### 4. Owner phone discovery
+### 4. Decision-maker phone discovery
 
-Once the owner is named, search specifically:
-`"<owner name>" Bogotá teléfono`, `"<owner name>" WhatsApp`,
-`"<owner name>" Instagram`, `"<owner name>" LinkedIn`, `"<owner name>" website`,
-`"<owner name>" clínica/despacho/estudio`, plus relevant professional
-directories. Only public, professionally-published numbers count — never
-private or leaked data. Record `Owner Phone Source` with enough specificity to
-audit later (e.g. "Instagram oficial @drname, bio", not just "Instagram").
+Once a decision-maker is named, search specifically:
+`"<name>" Bogotá teléfono`, `"<name>" WhatsApp`,
+`"<name>" Instagram`, `"<name>" LinkedIn`, `"<name>" website`,
+`"<name>" clínica/despacho/estudio`, plus relevant professional
+directories (Doctoralia, colegios profesionales). Only public,
+professionally-published numbers count — never private or leaked data.
+Record `Owner Phone Source` with enough specificity to audit later (e.g.
+"Instagram oficial @drname, bio", not just "Instagram"), and
+`Owner Phone Evidence` describing HOW the person↔number link was proven, not
+just where it was seen. See `docs/owner_phone_sources_v3.md` in the memory
+repo for the full 5-tier hierarchy and contradiction-handling protocol.
 
 ### 5. Website audit (visit it for real)
 
@@ -138,14 +203,14 @@ contact path is a generic phone number in the footer.`
 ### 6. Social discovery
 
 Find and verify (don't guess) official Instagram, Facebook, LinkedIn, TikTok
-(if relevant), and the owner's own professional profile. A profile only
-counts as "official" if there's real evidence it belongs to this business/person
-(bio matches, linked from the real site, tagged posts, etc.) — never assume from
-a similar-looking username.
+(if relevant), and each decision-maker's own professional profile. A profile
+only counts as "official" if there's real evidence it belongs to this
+business/person (bio matches, linked from the real site, tagged posts, etc.)
+— never assume from a similar-looking username.
 
-### 7. Score, validate, and gate
+### 7. Score, validate, and gate (v3: Lead Quality + Contact Quality, separately)
 
-Populate `high_ticket_score`, `website_opportunity_score`, `owner_access_score`,
+Populate `high_ticket_score`, `website_opportunity_score`,
 `data_quality_score` (0-10 each, based on what was actually found) on a
 `schema.Lead`, then run it through the gate AND the evidence-quality check
 (a lead can satisfy the gate's "field is non-empty" test while still being
@@ -153,43 +218,51 @@ too vague to trust — `validate.py` catches that):
 
 ```python
 import sys; sys.path.insert(0, "skills/nodoto-lead-hunter/scripts")
-from schema import Lead
+from schema import Lead, DecisionMaker
 from scoring import run_qualification_gate
 from validate import validate_evidence_quality
 
-lead = Lead(business_name=..., niche=..., owner_name=..., owner_role=...,
-            owner_phone=..., owner_phone_source=..., website_problem=...,
-            website_evidence=..., high_ticket_score=..., website_opportunity_score=...,
-            owner_access_score=..., data_quality_score=...)
+lead = Lead(business_name=..., niche=..., website_problem=..., website_evidence=...,
+            high_ticket_score=..., website_opportunity_score=..., data_quality_score=...)
+lead.set_decision_makers([
+    DecisionMaker(name=..., role=..., authority_level=..., is_current=True,
+                  phone=..., phone_confidence=..., phone_source=..., phone_evidence=...,
+                  verification_status=..., priority=1),
+    # ...additional decision-makers, never dropped, priority=2, 3, ...
+])
 result = run_qualification_gate(lead)
-# result.passed, result.status, result.reasons ; lead.lead_score, lead.lead_tier now set
+# result.passed, result.status, result.reasons
+# lead.lead_score, lead.lead_tier, lead.lead_quality_score, lead.contact_quality_score now set
 quality = validate_evidence_quality(lead)
-# quality.ok must also be True — a generic Owner Phone Source ("Instagram" alone)
-# or a vague Website Problem ("website is bad") fails validation even if the
-# gate's non-empty check passed.
+# quality.ok must also be True
 ```
 
-Weights: Business Value 25%, Website Opportunity 30%, Owner Access 20%, Contact
-Data Quality 15%, Market/Urgency 10% (fold urgency into `high_ticket_score` unless
-you pass `market_urgency_score` explicitly). Tiers: 9.0-10 VIP, 8.0-8.9 A,
-7.0-7.9 B, below 7 discard. **`OWNER_PHONE_MISSING` always overrides tier/score.**
+Lead Quality weights: High Ticket 45%, Website Opportunity 40%, Data Quality
+15% (no contact signal). Contact Quality is built entirely from decision-maker
+reachability (name/role/authority + phone confidence tier + evidence +
+verification status) — see `scoring.py`. Combined `lead_score` blends them
+60/40 for VIP/A/B tier ranking, but **the gate itself never qualifies a lead
+without DIRECT or NAMED_ATTRIBUTION on the primary decision-maker**,
+regardless of either score. Tiers: 9.0-10 VIP, 8.0-8.9 A, 7.0-7.9 B, below 7
+discard. `OWNER_PHONE_MISSING` always overrides tier/score.
 
-### 8. Dedupe
+### 8. Dedupe (v3: also checks decision-maker reuse across leads)
 
 ```python
-from dedupe import load_all_repo_sources, load_sheet_rows, find_duplicate, find_fuzzy_candidates
+from dedupe import (load_all_repo_sources, load_sheet_rows, find_duplicate,
+                     find_fuzzy_candidates, load_bogota_leads_decision_makers,
+                     find_decision_maker_reuse)
 existing = load_all_repo_sources(repo_root) + load_sheet_rows(sheet_rows_as_dicts)
-dup = find_duplicate(lead, existing)          # exact-signal match -> auto-drop
-fuzzy = find_fuzzy_candidates(lead, existing)  # near-miss names -> flag for a second look, don't auto-drop
+existing_dms = load_bogota_leads_decision_makers(repo_root / "data" / "bogota_leads.csv")
+dup = find_duplicate(lead, existing)                    # exact-signal match -> auto-drop
+fuzzy = find_fuzzy_candidates(lead, existing)             # near-miss names -> flag, don't auto-drop
+reuse = find_decision_maker_reuse(lead, existing_dms)     # same person, different business -> flag, don't auto-drop
 ```
 
 Matches on normalized owner phone, domain, email, Instagram handle, or
 normalized business/owner name (order- and stopword-insensitive, catches
 "Dr. Juan Pérez Dermatología" == "Juan Pérez Laser Center" when other signals
 agree). A match means the candidate is dropped, not silently merged.
-`find_fuzzy_candidates` additionally catches near-miss spellings (e.g. "SAS"
-suffix, missing "de") that the exact matcher wouldn't — surface these to the
-agent/user as a warning rather than silently dropping or silently keeping.
 
 ### 9. Write (append-only, Sheets + CSV mirror)
 
@@ -213,9 +286,10 @@ skip the Sheets write rather than guessing at a connection.
 
 Everything from dedupe through CSV writing and the final report is one
 deterministic command once research is done. The agent still has to do the
-actual discovery/owner-research/website-audit work (that needs live browsing
-and judgment) and produce a JSON file of candidates — `tests/candidates_sample.json`
-shows the shape — but from there:
+actual discovery/decision-maker-research/website-audit work (that needs live
+browsing and judgment) and produce a JSON file of candidates —
+`tests/candidates_sample.json` shows the shape (a `decision_makers` list is
+accepted directly) — but from there:
 
 ```bash
 python3 skills/nodoto-lead-hunter/scripts/cli.py run candidates.json \
@@ -226,11 +300,13 @@ python3 skills/nodoto-lead-hunter/scripts/cli.py run candidates.json \
 ```
 
 This validates each candidate, dedupes against the repo's CSVs (+ the Sheet
-export if provided) AND against other candidates in the same batch, runs the
-qualification gate and evidence-quality check, writes
-`qualified_leads_<run>.csv` and `candidates_owner_phone_missing_<run>.csv`,
-and prints the fixed-format run report — with discard/duplicate reasons on
-stderr for auditing. To rank niches before picking one:
+export if provided, + decision-maker reuse across the whole memory) AND
+against other candidates in the same batch, runs the qualification gate and
+evidence-quality check, writes `qualified_leads_<run>.csv`,
+`candidates_owner_phone_missing_<run>.csv`, and `clean_export_<run>.csv` (the
+exact one-row-per-lead answer table), and prints the fixed-format run report
+— with discard/duplicate/reuse-flag reasons on stderr for auditing. To rank
+niches before picking one:
 
 ```bash
 python3 skills/nodoto-lead-hunter/scripts/cli.py rank-niches --repo-root .
@@ -241,108 +317,71 @@ python3 skills/nodoto-lead-hunter/scripts/cli.py rank-niches --repo-root .
 Re-read the worksheet (if written) and run `sheets_io.verify_write(...)`. If
 it fails, stop and report — do not retry blindly. For CSV-only runs, verify by
 re-reading the written CSV row count against the in-memory qualified list.
+**Before ever calling a run "production-ready", actually execute
+`tests/test_pipeline.py` AND run `cli.py run` against a real repo-shaped
+directory** — unit tests alone did not catch two real wiring bugs in this
+skill's own CLI entrypoint; only an actual `cli.py run` invocation did.
 
 ### 11. Report
 
-Render with `scripts/report.py`:
-
-```python
-from report import RunStats, render_report
-print(render_report(RunStats(niche=..., candidates_found=..., ...)))
-```
-
-Output format (fixed):
-
-```
-NODOTO LEAD HUNTER — RUN COMPLETE
-
-Nicho:
-<niche>
-
-Candidatos encontrados:
-<n>
-
-Investigados:
-<n>
-
-Descartados:
-<n>
-
-Qualified Leads:
-<n>
-
-VIP:
-<n>
-
-A:
-<n>
-
-B:
-<n>
-
-Owner identificado:
-<n>/<n>
-
-Owner Phone verificado:
-<n>/<n>
-
-Website auditado:
-<n>/<n>
-
-Instagram:
-<n>/<n>
-
-Duplicados:
-<n>
-
-Google Sheet:
-<name or "N/A (CSV-only output)">
-
-Worksheet:
-<name>
-
-Cuenta Composio:
-<verified account, or "N/A">
-```
+Render with `scripts/report.py` (`render_report` for the fixed-format summary,
+`build_clean_export_table` for the one-row-per-lead answer table). See
+`report.py`'s `RunStats.from_qualified()` for deriving the v3 quality-breakdown
+fields automatically from the qualified leads.
 
 ## Batching target
 
-Discover 20-40, research all, expect real attrition. Target 10-20 truly
-qualified leads per run. If only 6 are genuinely good, deliver 6 — never pad
-the batch with weak leads to hit a round number.
+Discover 20-40+ per niche (more than one niche per day if needed to reach the
+target), research all, expect real attrition. Target **30-50 truly qualified
+leads per day** — but quality over quantity always: if only 12 are genuinely
+good, deliver 12, never pad the batch with weak leads or estimated/invented
+phone numbers to hit a round number.
 
 ## Anti-fabrication (inherited, non-negotiable)
 
-Never invent: owner name, phone, website, socials, score, observations,
-pricing, or revenue. Anything unverifiable is `NOT_VERIFIED`, not a guess.
-This mirrors `docs/outreach_playbook.md`'s existing anti-fabrication rule for
-emails — this skill extends the same discipline to owners and phones.
+Never invent: decision-maker name, phone, website, socials, score,
+observations, pricing, or revenue. Anything unverifiable is `NOT_VERIFIED`,
+not a guess. This mirrors `docs/outreach_playbook.md`'s existing
+anti-fabrication rule for emails — this skill extends the same discipline to
+decision-makers and phones, now enforced additionally by
+`scoring.phone_format_is_plausible()` and `scoring._validate_enum_fields()`,
+which reject garbled numbers and invented confidence/status/authority values
+outright rather than silently accepting them.
 
 ## What this skill does NOT do
 
 It does not send emails, does not touch `sent_tracking.csv` or
 `known_bad_contacts.csv` write paths, does not modify follow-up sequencing,
 and does not change the existing 3-account Gmail round-robin. It only
-discovers, qualifies, and writes new leads. Log the run in
-`docs/methodology_and_status.md` following the existing entry format, same as
-every other run in this repo's history — but as its own dated entry, not
-mixed into the cold-email run log.
+discovers, qualifies, and writes new leads. Log the run in the memory repo's
+`docs/run_log.md` following the existing entry format — as its own dated
+entry, not mixed into the cold-email run log.
 
 ## Files in this skill
 
-- `scripts/schema.py` — canonical `Lead` dataclass + column schema.
-- `scripts/dedupe.py` — normalization + exact and fuzzy duplicate detection against Sheet + repo CSVs.
-- `scripts/scoring.py` — the owner-phone qualification gate + weighted score/tier.
-- `scripts/validate.py` — evidence-quality checks (rejects generic phone sources, vague website-problem text).
-- `scripts/niche_priority.py` — Niche Opportunity Score ranking from real repo/Sheet coverage data.
+- `scripts/schema.py` — canonical `Lead` + `DecisionMaker` dataclasses, 5-tier
+  phone confidence, verification status, authority levels.
+- `scripts/dedupe.py` — normalization + exact and fuzzy duplicate detection,
+  plus cross-lead decision-maker reuse detection.
+- `scripts/scoring.py` — the qualification gate (decision-maker phone tier +
+  is_current + contradiction checks) + separate Lead Quality / Contact
+  Quality scoring + anti-hallucination phone-format and enum validation.
+- `scripts/validate.py` — evidence-quality checks (rejects generic phone
+  sources/evidence, vague website-problem text, unrecorded secondary
+  decision-makers).
+- `scripts/niche_priority.py` — Niche Opportunity Score ranking from real
+  repo/Sheet coverage data.
 - `scripts/sheets_io.py` — Sheets write-plan/verify contract + CSV fallback writer.
-- `scripts/report.py` — fixed-format run report.
-- `scripts/cli.py` — single entrypoint running dedupe → gate → validate → score → write → report over a JSON candidates file.
+- `scripts/report.py` — fixed-format run report + the exact one-row-per-lead
+  clean export table.
+- `scripts/cli.py` — single entrypoint running dedupe → gate → validate →
+  score → write → report over a JSON candidates file.
 - `references/composio_tools.md` — exact Composio call sequence + account-verification steps.
-- `tests/test_pipeline.py` — 20 self-checks covering normalization, exact + fuzzy
-  dedupe, the gate (including the "business phone relabeled as owner phone"
-  trap and the "unset email falsely matches another unset email" trap this
-  suite actually caught during development), evidence validation, niche
-  ranking, and CSV output. Run after any change:
+- `tests/test_pipeline.py` — the 8 mandated E2E scenarios (single/multi
+  decision-maker, generic/verified-business-only phone rejection,
+  named-attribution, contradictory sources, no-website, multi-location,
+  former-founder), anti-hallucination checks, decision-maker-reuse, and a
+  subprocess-level test of `cli.py run` itself (the only thing that caught
+  two real production bugs in this skill's own wiring). Run after any change:
   `python3 skills/nodoto-lead-hunter/tests/test_pipeline.py`.
 - `tests/candidates_sample.json` — example input shape for `cli.py run`.
