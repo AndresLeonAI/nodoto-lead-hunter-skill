@@ -3,6 +3,23 @@ name: nodoto-lead-hunter
 description: High-ticket sales opportunity engine for NODOTO AGENCY. Discovers Bogotá businesses in one niche at a time with weak digital presence, identifies the owner/decision-maker and their publicly-verifiable professional phone, audits the real website, scores and dedupes the result, and writes only fully-qualified leads to the NODOTO Google Sheet via Composio (with an automatic CSV fallback/mirror). Use when asked to find leads, prospect, hunt for clients, or run lead generation for NODOTO.
 ---
 
+> **ACTUALIZACION v2 (obligatoria, lee esto primero):** este proceso quedo
+> reemplazado/complementado por la metodologia en
+> [nodoto-lead-hunter-memory](https://github.com/AndresLeonAI/nodoto-lead-hunter-memory):
+> `docs/methodology_v2.md` (descubrimiento estructurado via Google Maps,
+> escalamiento a 30-50 calificados/dia, senales reales de facturacion, rama
+> para negocios sin sitio web) y `docs/owner_phone_sources.md` (la unica
+> fuente valida para identificar el telefono del TOMADOR DE DECISION, nunca
+> el de recepcion/conmutador — reemplaza cualquier instruccion equivalente
+> mas abajo en este archivo). El schema (`schema.py`) ahora exige un campo
+> `Owner Phone Confidence` (`DIRECT` / `NAMED_ATTRIBUTION`) para que un
+> lead pueda calificar — ver ese repo antes de correr cualquier corrida,
+> manual o programada. Ese repo tambien es la memoria persistente
+> (`data/bogota_leads.csv`, etc.): leela antes de investigar y escribele al
+> terminar, en vez de asumir que este repo tiene el historial.
+
+
+
 # NODOTO LEAD HUNTER
 
 A high-ticket sales opportunity engine, not a generic scraper. It exists to answer
