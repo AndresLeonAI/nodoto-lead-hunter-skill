@@ -1,0 +1,51 @@
+[
+  {
+    "Business Name": "Centro Dermatológico Láser Bogotá",
+    "Niche": "Dermatólogos de tratamientos láser",
+    "City": "Bogotá",
+    "Owner Name": "Dra. Camila Restrepo",
+    "Owner Role": "Directora médica y fundadora",
+    "Owner Phone": "+57 315 555 0199",
+    "Owner Phone Source": "Instagram oficial @dra.camilarestrepo, bio con boton 'Agenda tu cita'",
+    "Website": "https://centrodermatologicobogota.example",
+    "Website Problem": "The booking form on the homepage submits but never sends a confirmation email or redirect, so visitors can't tell if their appointment request went through.",
+    "Website Evidence": "Submitted a test appointment request on 2026-09-11 at 14:02 local time; page reloaded blank with no confirmation message and no email arrived after 20 minutes.",
+    "Instagram": "https://instagram.com/dra.camilarestrepo",
+    "High Ticket Score": 9,
+    "Website Opportunity Score": 8.5,
+    "Owner Access Score": 9,
+    "Data Quality Score": 8
+  },
+  {
+    "Business Name": "Láser & Piel Clínica Estética",
+    "Niche": "Dermatólogos de tratamientos láser",
+    "City": "Bogotá",
+    "Owner Name": "Dr. Andrés Vargas",
+    "Owner Role": "Director médico",
+    "Owner Phone": "NOT_VERIFIED",
+    "Owner Phone Source": "NOT_VERIFIED",
+    "Website": "https://laserypielclinica.example",
+    "Website Problem": "No SSL certificate on the booking subdomain; browsers show a security warning before the form loads.",
+    "Website Evidence": "Visited https://citas.laserypielclinica.example on 2026-09-11 and Chrome blocked the page with 'Your connection is not private'.",
+    "High Ticket Score": 8,
+    "Website Opportunity Score": 7,
+    "Owner Access Score": 3,
+    "Data Quality Score": 5
+  },
+  {
+    "Business Name": "Dermolaser Bogota SAS",
+    "Niche": "Dermatólogos de tratamientos láser",
+    "City": "Bogotá",
+    "Owner Name": "Camila Restrepo",
+    "Owner Role": "Fundadora",
+    "Owner Phone": "3155550199",
+    "Owner Phone Source": "Instagram, bio",
+    "Website": "https://centrodermatologicobogota.example/",
+    "Website Problem": "Same booking form issue.",
+    "Website Evidence": "Same as above.",
+    "High Ticket Score": 9,
+    "Website Opportunity Score": 8,
+    "Owner Access Score": 9,
+    "Data Quality Score": 8
+  }
+]

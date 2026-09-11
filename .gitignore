@@ -1,0 +1,37 @@
+﻿# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+.Python
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Output directories
+output/
+skills/nodoto-lead-hunter/output/
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment and Secrets
+.env
+.env.local
+*.secret
+*.pem
+*.key
+
+# Operating System & IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
