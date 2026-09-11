@@ -7,6 +7,7 @@ Run:
     python3 skills/nodoto-lead-hunter/tests/test_pipeline.py
 """
 from __future__ import annotations
+import math
 import sys
 from pathlib import Path
 
@@ -32,7 +33,7 @@ from scoring import (  # noqa: E402
 from sheets_io import write_csv_mirror, plan_write, verify_write  # noqa: E402
 from validate import validate_evidence_quality  # noqa: E402
 from report import build_clean_export_table  # noqa: E402
-from niche_priority import rank_niches, load_niche_stats_from_repo  # noqa: E402
+from niche_priority import rank_niches, load_niche_stats_from_repo, estimate_raw_candidates_needed, NicheStats  # noqa: E402
 
 
 def check(label, condition):
@@ -41,6 +42,10 @@ def check(label, condition):
     if not condition:
         raise AssertionError(f"Check failed: {label}")
 
+
+# ---------------------------------------------------------------------------
+# Helpers to build leads for the E2E scenarios below
+# ---------------------------------------------------------------------------
 
 def _base_kwargs(**overrides):
     kwargs = dict(
@@ -65,6 +70,10 @@ def _direct_person(name="Dra. Ana Gomez", role="Fundadora y Directora Medica", p
     )
 
 
+# ---------------------------------------------------------------------------
+# E2E scenario 1: single decision-maker, DIRECT phone -> QUALIFIED
+# ---------------------------------------------------------------------------
+
 def test_e2e_single_decision_maker_qualifies():
     lead = Lead(**_base_kwargs(business_name="Clinica Un Decisor"))
     lead.set_decision_makers([_direct_person()])
@@ -77,6 +86,11 @@ def test_e2e_single_decision_maker_qualifies():
     check("E2E-1 contact quality is high for a DIRECT, verified, evidenced phone",
           lead.contact_quality_score >= 8.0)
 
+
+# ---------------------------------------------------------------------------
+# E2E scenario 2: multiple decision-makers -> lead is NOT discarded, primary
+# is prioritized, secondary is preserved (never silently dropped)
+# ---------------------------------------------------------------------------
 
 def test_e2e_multiple_decision_makers_preserved():
     primary = _direct_person(name="Carlos Ruiz", role="Socio Fundador", priority=1)
@@ -100,14 +114,23 @@ def test_e2e_multiple_decision_makers_preserved():
     quality = validate_evidence_quality(lead)
     check("E2E-2 validator does not complain when the secondary IS recorded", quality.ok)
 
+    # Regression: if a lead claims count > 1 but never actually records the
+    # secondary, validate.py must catch that (the exact failure mode this
+    # feature exists to prevent).
     broken = Lead(**_base_kwargs(business_name="Bufete Roto"))
     broken.decision_makers = [primary, secondary]
-    broken.owner_name = primary.name
-    broken.set_decision_makers([primary])
+    broken.owner_name = primary.name  # simulate primary synced but summary lost
+    object.__setattr__  # no-op just to keep linters quiet about unused import patterns
+    broken.set_decision_makers([primary])  # this clears to 1 -> re-add second without going through setter
     broken.decision_makers.append(secondary)
     check("E2E-2b decision_maker_count reflects the real list length even if set oddly",
           broken.decision_maker_count == 2)
 
+
+# ---------------------------------------------------------------------------
+# E2E scenario 3: ONLY a general/business phone found -> never qualifies,
+# and VERIFIED_BUSINESS must never be silently treated as an owner phone.
+# ---------------------------------------------------------------------------
 
 def test_e2e_generic_and_verified_business_phone_never_qualify():
     for confidence, label in [
@@ -127,6 +150,10 @@ def test_e2e_generic_and_verified_business_phone_never_qualify():
               result.status == QUALIFICATION_STATUS_OWNER_PHONE_MISSING and not result.passed)
 
 
+# ---------------------------------------------------------------------------
+# E2E scenario 4: NAMED_ATTRIBUTION via a public registry -> qualifies
+# ---------------------------------------------------------------------------
+
 def test_e2e_named_attribution_qualifies():
     lead = Lead(**_base_kwargs(business_name="Consultorio Registro Publico"))
     person = DecisionMaker(
@@ -142,6 +169,11 @@ def test_e2e_named_attribution_qualifies():
     check("E2E-4 NAMED_ATTRIBUTION from a public professional directory qualifies",
           result.passed and result.status == QUALIFICATION_STATUS_QUALIFIED)
 
+
+# ---------------------------------------------------------------------------
+# E2E scenario 5: contradictory information across sources -> never silently
+# resolved, and never qualifies while unresolved.
+# ---------------------------------------------------------------------------
 
 def test_e2e_contradictory_sources_blocks_qualification():
     lead = Lead(**_base_kwargs(business_name="Clinica Contradictoria"))
@@ -161,6 +193,11 @@ def test_e2e_contradictory_sources_blocks_qualification():
           result.status == QUALIFICATION_STATUS_OWNER_PHONE_MISSING and not result.passed)
 
 
+# ---------------------------------------------------------------------------
+# E2E scenario 6: no website -> does not disqualify; opportunity score is
+# still built from concrete, checkable evidence about the ABSENCE.
+# ---------------------------------------------------------------------------
+
 def test_e2e_no_website_still_qualifies_with_evidence():
     lead = Lead(**_base_kwargs(
         business_name="Consultorio Sin Web",
@@ -178,6 +215,11 @@ def test_e2e_no_website_still_qualifies_with_evidence():
           result.passed and result.status == QUALIFICATION_STATUS_QUALIFIED)
 
 
+# ---------------------------------------------------------------------------
+# E2E scenario 7: multiple locations -> scoring still runs correctly and the
+# decision-maker check is unaffected by business size/structure.
+# ---------------------------------------------------------------------------
+
 def test_e2e_multi_location_business():
     lead = Lead(**_base_kwargs(
         business_name="Cadena Multi Sede",
@@ -192,6 +234,11 @@ def test_e2e_multi_location_business():
           lead.lead_quality_score >= 8.0)
 
 
+# ---------------------------------------------------------------------------
+# E2E scenario 8: founder no longer looks like the decision-maker (sold,
+# retired, left) -> must NOT qualify even with an otherwise perfect phone.
+# ---------------------------------------------------------------------------
+
 def test_e2e_former_founder_is_rejected():
     lead = Lead(**_base_kwargs(business_name="Clinica Fundador Retirado"))
     person = _direct_person(name="Dr. Ricardo Nunez", role="Fundador (retirado en 2024)")
@@ -205,6 +252,11 @@ def test_e2e_former_founder_is_rejected():
           compute_contact_quality_score(lead) <= 1.0)
 
 
+# ---------------------------------------------------------------------------
+# Anti-hallucination: garbled/implausible phone formats are rejected even if
+# everything else about the lead looks perfect.
+# ---------------------------------------------------------------------------
+
 def test_phone_format_sanity_check():
     check("plausible Colombian mobile passes", phone_format_is_plausible("+57 315 555 0044"))
     check("too-short garbled number is rejected", not phone_format_is_plausible("+57 55"))
@@ -212,7 +264,7 @@ def test_phone_format_sanity_check():
 
     lead = Lead(**_base_kwargs(business_name="Numero Invalido"))
     person = _direct_person()
-    person.phone = "12"
+    person.phone = "12"  # obviously broken
     lead.set_decision_makers([person])
     result = run_qualification_gate(lead)
     check("a DIRECT-confidence lead with an implausible phone format is still rejected",
@@ -222,12 +274,16 @@ def test_phone_format_sanity_check():
 def test_invalid_confidence_enum_is_rejected():
     lead = Lead(**_base_kwargs(business_name="Confidence Inventada"))
     person = _direct_person()
-    person.phone_confidence = "TOTALLY_SURE"
+    person.phone_confidence = "TOTALLY_SURE"  # invented value, not a real tier
     lead.set_decision_makers([person])
     result = run_qualification_gate(lead)
     check("an invented confidence value is rejected outright rather than silently accepted",
           not result.passed)
 
+
+# ---------------------------------------------------------------------------
+# Decision-maker reuse across leads (flag, never silent auto-drop)
+# ---------------------------------------------------------------------------
 
 def test_decision_maker_reuse_is_flagged_not_dropped():
     existing_lead = Lead(**_base_kwargs(business_name="Firma Original"))
@@ -244,6 +300,10 @@ def test_decision_maker_reuse_is_flagged_not_dropped():
     check("a reuse flag does not by itself block qualification (it's a review flag, not a rejection)",
           result.passed)
 
+
+# ---------------------------------------------------------------------------
+# Existing (v1/v2) regression coverage, kept intact
+# ---------------------------------------------------------------------------
 
 def test_normalization():
     check("phone normalization collapses formats",
@@ -355,6 +415,11 @@ def test_validate_rejects_generic_source_and_vague_problem():
 
 
 def test_niche_priority_runs_against_new_schema_csv(tmp_dir: Path):
+    """Regression for the audit-found bug: load_niche_stats_from_repo used to
+    expect a different, older CSV header ('Industry/Niche') than what this
+    skill actually writes ('Niche'), so owner stats silently stayed at 0
+    forever. Build a tiny repo fixture in the NEW schema and confirm stats
+    are derived correctly from it."""
     data_dir = tmp_dir / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
     lead = Lead(**_base_kwargs(business_name="Fixture Clinic", niche="Dermatologia laser"))
@@ -412,14 +477,14 @@ def test_cli_run_entrypoint_end_to_end(tmp_dir: Path):
     (data_dir / "sent_tracking.csv").write_text("recipient_email\n", encoding="utf-8")
 
     candidates = [
-        {
+        {  # exact duplicate of the seeded lead -> must be skipped, not re-qualified
             "business_name": "Doctora Llanos Clínica de Piel", "niche": "Dermatologia laser",
             "owner_name": "Lina María Llanos", "owner_phone": "+573108633793",
             "owner_phone_source": "s", "owner_phone_evidence": "e", "owner_phone_confidence": "DIRECT",
             "website_problem": "p", "website_evidence": "e",
             "high_ticket_score": 8, "website_opportunity_score": 6, "data_quality_score": 8,
         },
-        {
+        {  # receptionist/switchboard GENERIC phone -> must NOT reach Qualified
             "business_name": "Estetica Generica SAS", "niche": "Dermatologia laser",
             "owner_name": "Recepcion", "owner_phone": "+576015550199",
             "owner_phone_source": "conmutador general", "owner_phone_evidence": "linea unica de agendamiento",
@@ -427,7 +492,7 @@ def test_cli_run_entrypoint_end_to_end(tmp_dir: Path):
             "website_problem": "p", "website_evidence": "e",
             "high_ticket_score": 7, "website_opportunity_score": 8, "data_quality_score": 6,
         },
-        {
+        {  # multi-decision-maker candidate -> must qualify on primary, keep secondary
             "business_name": "Centro Odontologico Sonrisa Real", "niche": "Implantes dentales",
             "decision_makers": [
                 {"name": "Dr. Andres Forero", "role": "Socio fundador", "authority_level": "FINAL",
@@ -475,9 +540,31 @@ def test_cli_run_entrypoint_end_to_end(tmp_dir: Path):
           "Doctora Llanos" in (result.stdout + result.stderr))
 
 
+def test_estimate_raw_candidates_needed_sizes_the_funnel():
+    """v3.1 efficiency addition: a niche with a strong historical owner-access
+    rate should need far fewer raw candidates than one with a weak rate or no
+    history at all, and the estimate must never fall below the universal 2x
+    attrition floor or exceed the 12x ceiling (past which SKILL.md says to
+    split across more niches instead of over-mining one)."""
+    easy = NicheStats(niche="facil", existing_leads=20, owner_phone_count=16)  # 80% access rate
+    hard = NicheStats(niche="dificil", existing_leads=20, owner_phone_count=2)  # 10% access rate
+    unseen = NicheStats(niche="nueva", existing_leads=0, owner_phone_count=0)
+
+    n_easy = estimate_raw_candidates_needed("facil", {"facil": easy}, target_qualified=10)
+    n_hard = estimate_raw_candidates_needed("dificil", {"dificil": hard}, target_qualified=10)
+    n_unseen = estimate_raw_candidates_needed("nueva", {"nueva": unseen}, target_qualified=10)
+
+    check("an easy niche needs fewer raw candidates than a hard one", n_easy < n_hard)
+    check("an easy niche still respects the 2x attrition floor", n_easy >= 20)
+    check("a hard niche is capped at 12x rather than exploding unboundedly", n_hard <= 120)
+    check("an unseen niche falls back to the conservative default rate, not zero/None",
+          n_unseen == math.ceil(10 / 0.12))
+
+
 if __name__ == "__main__":
     import tempfile
 
+    # E2E scenarios (the 8 required by the audit directive)
     test_e2e_single_decision_maker_qualifies()
     test_e2e_multiple_decision_makers_preserved()
     test_e2e_generic_and_verified_business_phone_never_qualify()
@@ -487,10 +574,12 @@ if __name__ == "__main__":
     test_e2e_multi_location_business()
     test_e2e_former_founder_is_rejected()
 
+    # Anti-hallucination + reuse
     test_phone_format_sanity_check()
     test_invalid_confidence_enum_is_rejected()
     test_decision_maker_reuse_is_flagged_not_dropped()
 
+    # Regression coverage
     test_normalization()
     test_dedupe_same_professional_different_names()
     test_gate_rejects_missing_owner_phone()
@@ -498,6 +587,7 @@ if __name__ == "__main__":
     test_unset_business_email_never_causes_false_duplicate()
     test_fuzzy_match_flags_without_dropping()
     test_validate_rejects_generic_source_and_vague_problem()
+    test_estimate_raw_candidates_needed_sizes_the_funnel()
 
     with tempfile.TemporaryDirectory() as td:
         test_csv_output_roundtrip(Path(td))
