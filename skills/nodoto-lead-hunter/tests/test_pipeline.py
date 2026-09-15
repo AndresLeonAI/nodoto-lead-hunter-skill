@@ -21,7 +21,12 @@ from schema import (  # noqa: E402
     PHONE_CONFIDENCE_VERIFIED_BUSINESS, PHONE_CONFIDENCE_GENERIC,
     VERIFICATION_STATUS_VERIFIED, VERIFICATION_STATUS_CONTRADICTED,
     AUTHORITY_FINAL, AUTHORITY_INFLUENCER,
+    CONTACT_ROLE_UNKNOWN, CONTACT_ROLE_OWNER_FOUNDER, CONTACT_ROLE_PARTNER,
+    CONTACT_ROLE_DIRECTOR_MANAGER, CONTACT_ROLE_SOLE_PRACTITIONER,
+    CONTACT_ROLE_RECEPTION, CONTACT_ROLE_SECRETARY, CONTACT_ROLE_SCHEDULING,
+    CONTACT_ROLE_CALL_CENTER, CONTACT_ROLE_GENERAL_WHATSAPP, CONTACT_ROLE_BUSINESS_LINE,
 )
+from role_guard import role_contradicts_evidence, detect_non_decision_maker_signals  # noqa: E402
 from dedupe import (  # noqa: E402
     fingerprint_lead, find_duplicate, find_fuzzy_candidates, find_decision_maker_reuse,
     fingerprint_all_decision_makers, normalize_text, normalize_phone, normalize_domain, normalize_email,
@@ -62,9 +67,10 @@ def _base_kwargs(**overrides):
     return kwargs
 
 
-def _direct_person(name="Dra. Ana Gomez", role="Fundadora y Directora Medica", priority=1):
+def _direct_person(name="Dra. Ana Gomez", role="Fundadora y Directora Medica", priority=1,
+                    contact_role=CONTACT_ROLE_OWNER_FOUNDER):
     return DecisionMaker(
-        name=name, role=role, authority_level=AUTHORITY_FINAL, is_current=True,
+        name=name, role=role, authority_level=AUTHORITY_FINAL, contact_role=contact_role, is_current=True,
         phone="+57 315 555 0044", phone_confidence=PHONE_CONFIDENCE_DIRECT,
         phone_source="Sitio web propio de la doctora, seccion 'Agenda tu cita'",
         phone_evidence="El boton de WhatsApp en dranagomez.com/contacto abre wa.me/573155550044, "
@@ -160,7 +166,8 @@ def test_e2e_generic_and_verified_business_phone_never_qualify():
 def test_e2e_named_attribution_qualifies():
     lead = Lead(**_base_kwargs(business_name="Consultorio Registro Publico"))
     person = DecisionMaker(
-        name="Dr. Julian Vega", role="Odontologo titular", authority_level=AUTHORITY_FINAL, is_current=True,
+        name="Dr. Julian Vega", role="Odontologo titular", authority_level=AUTHORITY_FINAL,
+        contact_role=CONTACT_ROLE_SOLE_PRACTITIONER, is_current=True,
         phone="+57 320 444 5566", phone_confidence=PHONE_CONFIDENCE_NAMED_ATTRIBUTION,
         phone_source="Perfil de Doctoralia a su nombre, seccion 'Agendar cita'",
         phone_evidence="El perfil de Doctoralia verificado con su nombre completo y matricula profesional "
@@ -253,6 +260,99 @@ def test_e2e_former_founder_is_rejected():
           result.status == QUALIFICATION_STATUS_OWNER_PHONE_MISSING and not result.passed)
     check("E2E-8 contact_quality_score is capped low for a non-current decision-maker",
           compute_contact_quality_score(lead) <= 1.0)
+
+
+# ---------------------------------------------------------------------------
+# v4.0 "VAULT" — Owner Contact Role. Root-cause fix for the critical failure
+# the user reported directly (2026-09-15): the pipeline was delivering
+# "Owner Phone" numbers that belonged to receptionists, secretaries,
+# scheduling/appointment lines, call centers, general customer-service
+# WhatsApp, or generic business lines — never the actual decision-maker. See
+# schema.py's v4.0 docstring note and docs/owner_phone_vault_v4.md in the
+# memory repo for the full root-cause writeup.
+# ---------------------------------------------------------------------------
+
+def test_vault_v4_unclassified_contact_role_blocks_qualification():
+    lead = Lead(**_base_kwargs(business_name="Sin Clasificar"))
+    person = _direct_person(contact_role=CONTACT_ROLE_UNKNOWN)
+    lead.set_decision_makers([person])
+    result = run_qualification_gate(lead)
+    check("an unclassified (UNKNOWN) Owner Contact Role blocks qualification even with a "
+          "perfect DIRECT phone — treated exactly like a missing phone",
+          result.status == QUALIFICATION_STATUS_OWNER_PHONE_MISSING and not result.passed)
+    check("the rejection reason names the vault rule, not a generic phone-missing message",
+          any("Owner Contact Role" in r for r in result.reasons))
+
+
+def test_vault_v4_staff_roles_never_qualify_regardless_of_confidence():
+    for role_const, label in [
+        (CONTACT_ROLE_RECEPTION, "recepcionista"),
+        (CONTACT_ROLE_SECRETARY, "secretaria"),
+        (CONTACT_ROLE_SCHEDULING, "agenda/citas"),
+        (CONTACT_ROLE_CALL_CENTER, "call center"),
+        (CONTACT_ROLE_GENERAL_WHATSAPP, "WhatsApp general"),
+        (CONTACT_ROLE_BUSINESS_LINE, "linea empresarial"),
+    ]:
+        lead = Lead(**_base_kwargs(business_name=f"Negocio Staff ({label})"))
+        person = _direct_person(contact_role=role_const)
+        lead.set_decision_makers([person])
+        result = run_qualification_gate(lead)
+        check(f"a phone explicitly classified as {label} never qualifies as Owner Phone, "
+              f"even at DIRECT confidence with otherwise-clean evidence",
+              result.status == QUALIFICATION_STATUS_OWNER_PHONE_MISSING and not result.passed)
+
+
+def test_vault_v4_keyword_contradiction_overrides_a_mistaken_decision_maker_tag():
+    """Defense in depth: even if a sub-agent mis-tags Owner Contact Role as a
+    decision-maker role, if the phone source/evidence text itself names a
+    reception/secretary/scheduling/call-center/general-WhatsApp/business-line
+    signal, the vault rule rejects it anyway rather than trusting the tag."""
+    lead = Lead(**_base_kwargs(business_name="Etiqueta Incorrecta"))
+    person = _direct_person(role="Director Medico", contact_role=CONTACT_ROLE_DIRECTOR_MANAGER)
+    person.phone_source = "Centro de llamadas del consultorio"
+    person.phone_evidence = "La linea del call center confirma que este es el numero de agendamiento general."
+    lead.set_decision_makers([person])
+    result = run_qualification_gate(lead)
+    check("a decision-maker tag is overridden when the evidence text itself names a staff/call-center line",
+          result.status == QUALIFICATION_STATUS_OWNER_PHONE_MISSING and not result.passed)
+    check("the contradiction is also caught directly by role_guard, independent of the gate",
+          len(role_contradicts_evidence(CONTACT_ROLE_DIRECTOR_MANAGER, person.role, person.phone_source,
+                                         person.phone_evidence, person.phone_discrepancy)) > 0)
+
+
+def test_vault_v4_legitimate_owner_and_sole_practitioner_still_qualify():
+    """Regression: the vault rule must not collateral-damage real
+    decision-makers with clean, specific evidence — precision, not paranoia."""
+    lead1 = Lead(**_base_kwargs(business_name="Clinica Legitima Fundadora"))
+    lead1.set_decision_makers([_direct_person(role="Fundadora y Directora Medica",
+                                               contact_role=CONTACT_ROLE_OWNER_FOUNDER)])
+    result1 = run_qualification_gate(lead1)
+    check("a properly classified owner/founder still qualifies under the vault rule",
+          result1.passed and result1.status == QUALIFICATION_STATUS_QUALIFIED)
+
+    lead2 = Lead(**_base_kwargs(business_name="Consultorio Odontologo Solo"))
+    lead2.set_decision_makers([_direct_person(name="Dr. Julian Vega", role="Odontologo titular",
+                                               contact_role=CONTACT_ROLE_SOLE_PRACTITIONER)])
+    result2 = run_qualification_gate(lead2)
+    check("a solo-practitioner professional still qualifies under the vault rule",
+          result2.passed and result2.status == QUALIFICATION_STATUS_QUALIFIED)
+
+
+def test_vault_v4_keyword_detector_is_bilingual_and_specific():
+    check("Spanish 'recepcionista' is detected",
+          any(cat == "RECEPTION" for cat, _ in detect_non_decision_maker_signals("Es la recepcionista del consultorio")))
+    check("English 'receptionist' is detected",
+          any(cat == "RECEPTION" for cat, _ in detect_non_decision_maker_signals("She is the receptionist")))
+    check("'call center' / 'centro de llamadas' is detected",
+          any(cat == "CALL_CENTER" for cat, _ in detect_non_decision_maker_signals("Linea del centro de llamadas")))
+    check("'agenda de citas' scheduling line is detected",
+          any(cat == "SCHEDULING" for cat, _ in detect_non_decision_maker_signals("Linea de agenda de citas")))
+    check("a clean, specific, personal-attribution sentence triggers no false positive",
+          detect_non_decision_maker_signals(
+              "El boton de WhatsApp en su sitio personal abre wa.me con su numero de celular personal."
+          ) == [])
+    check("the word 'business' alone (as in 'high ticket business') never false-positives",
+          detect_non_decision_maker_signals("This is a great high ticket business to pursue.") == [])
 
 
 # ---------------------------------------------------------------------------
@@ -489,16 +589,45 @@ def test_cli_run_entrypoint_end_to_end(tmp_dir: Path):
         },
         {  # receptionist/switchboard GENERIC phone -> must NOT reach Qualified
             "business_name": "Estetica Generica SAS", "niche": "Dermatologia laser",
-            "owner_name": "Recepcion", "owner_phone": "+576015550199",
+            "owner_name": "Recepcion", "owner_contact_role": "RECEPTION", "owner_phone": "+576015550199",
             "owner_phone_source": "conmutador general", "owner_phone_evidence": "linea unica de agendamiento",
             "owner_phone_confidence": "GENERIC",
             "website_problem": "p", "website_evidence": "e",
             "high_ticket_score": 7, "website_opportunity_score": 8, "data_quality_score": 6,
         },
+        {  # v4.0 VAULT — THE EXACT BUG THE USER REPORTED: excellent phone-evidence
+           # tier (DIRECT, "verified") but the person is the receptionist/scheduler,
+           # not the owner. Before v4.0 this would have qualified; now it must not,
+           # regardless of confidence tier.
+            "business_name": "Spa Facial Vanidad", "niche": "Dermatologia laser",
+            "owner_name": "Yuliana Paez", "owner_role": "Recepcionista y encargada de agenda",
+            "owner_contact_role": "RECEPTION",
+            "owner_phone": "+573001234567",
+            "owner_phone_source": "WhatsApp de atencion al cliente publicado en el sitio",
+            "owner_phone_evidence": "El boton de WhatsApp del sitio abre wa.me a este numero; Yuliana "
+                                     "confirmo por telefono que es la linea de recepcion y agenda de citas.",
+            "owner_phone_confidence": "DIRECT", "owner_verification_status": "VERIFIED",
+            "website_problem": "p", "website_evidence": "e",
+            "high_ticket_score": 8, "website_opportunity_score": 8, "data_quality_score": 8,
+        },
+        {  # v4.0 VAULT — defense in depth: Owner Contact Role is mis-tagged as a
+           # decision-maker, but the source/evidence text itself names a call
+           # center — the keyword cross-check must catch it even when the tag lied.
+            "business_name": "Consultorio Sonrisa Feliz", "niche": "Dermatologia laser",
+            "owner_name": "Dr. Ficticio", "owner_role": "Director",
+            "owner_contact_role": "DIRECTOR_MANAGER",
+            "owner_phone": "+573009876543",
+            "owner_phone_source": "Centro de llamadas del consultorio",
+            "owner_phone_evidence": "El numero corresponde a la linea del call center que atiende todas las sedes.",
+            "owner_phone_confidence": "NAMED_ATTRIBUTION", "owner_verification_status": "VERIFIED",
+            "website_problem": "p", "website_evidence": "e",
+            "high_ticket_score": 8, "website_opportunity_score": 8, "data_quality_score": 8,
+        },
         {  # multi-decision-maker candidate -> must qualify on primary, keep secondary
             "business_name": "Centro Odontologico Sonrisa Real", "niche": "Implantes dentales",
             "decision_makers": [
                 {"name": "Dr. Andres Forero", "role": "Socio fundador", "authority_level": "FINAL",
+                 "contact_role": "PARTNER",
                  "is_current": True, "phone": "+573154028871", "phone_confidence": "DIRECT",
                  "phone_source": "Doctoralia", "phone_evidence": "wa.me enlazado a su perfil",
                  "verification_status": "VERIFIED", "priority": 1},
@@ -534,6 +663,12 @@ def test_cli_run_entrypoint_end_to_end(tmp_dir: Path):
           "Doctora Llanos Clínica de Piel" not in names)
     check("a receptionist/GENERIC-phone-only business never reaches Qualified",
           "Estetica Generica SAS" not in names)
+    check("v4.0 VAULT: a receptionist's number with excellent (DIRECT/verified) phone-evidence "
+          "still never reaches Qualified — the exact bug the user reported",
+          "Spa Facial Vanidad" not in names)
+    check("v4.0 VAULT: a mis-tagged decision-maker role is overridden when the evidence text "
+          "itself names a call-center line",
+          "Consultorio Sonrisa Feliz" not in names)
     check("the multi-decision-maker business qualifies on its primary",
           "Centro Odontologico Sonrisa Real" in names)
     sonrisa = next(r for r in rows if r["Business Name"] == "Centro Odontologico Sonrisa Real")
@@ -642,6 +777,14 @@ if __name__ == "__main__":
     test_e2e_multi_location_business()
     test_e2e_former_founder_is_rejected()
 
+    # v4.0 VAULT — Owner Contact Role (receptionist/secretary/scheduling/
+    # call-center/general-WhatsApp/business-line problem, fixed 2026-09-15)
+    test_vault_v4_unclassified_contact_role_blocks_qualification()
+    test_vault_v4_staff_roles_never_qualify_regardless_of_confidence()
+    test_vault_v4_keyword_contradiction_overrides_a_mistaken_decision_maker_tag()
+    test_vault_v4_legitimate_owner_and_sole_practitioner_still_qualify()
+    test_vault_v4_keyword_detector_is_bilingual_and_specific()
+
     # Anti-hallucination + reuse
     test_phone_format_sanity_check()
     test_invalid_confidence_enum_is_rejected()
@@ -666,5 +809,7 @@ if __name__ == "__main__":
 
     test_v3_2_clean_export_never_mixes_niches_and_has_a_cold_call_hook()
 
-    print("\nAll self-tests passed (v3.2: multi-decision-maker + 5-tier confidence + Lead/Contact Quality split "
-          "+ per-niche clean export + cold-call hook).")
+    print("\nAll self-tests passed (v4.0 VAULT: Owner Contact Role gate + keyword cross-check against "
+          "receptionist/secretary/scheduling/call-center/general-WhatsApp/business-line numbers, on top of "
+          "v3.2's multi-decision-maker + 5-tier confidence + Lead/Contact Quality split + per-niche clean "
+          "export + cold-call hook).")
