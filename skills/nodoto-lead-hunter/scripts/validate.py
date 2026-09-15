@@ -11,6 +11,12 @@ actually verifiable" patterns described in playbook rules #17 and #25.
 Use it as an additional check before writing to Qualified Leads — a lead can
 pass `scoring.run_qualification_gate` and still fail `validate_evidence_quality`
 if the research was shallow.
+
+v4.0 addition (2026-09-15): also re-runs `role_guard.role_contradicts_evidence()`
+as defense in depth against the receptionist/secretary/scheduling/call-center/
+general-WhatsApp/business-line problem documented in `schema.py`'s v4.0 note —
+the same cross-check the gate uses, applied here too so a mis-tagged Owner
+Contact Role is caught with a specific reason rather than silently passing.
 """
 
 from __future__ import annotations
@@ -18,6 +24,7 @@ import re
 from dataclasses import dataclass, field
 
 from schema import Lead
+from role_guard import role_contradicts_evidence
 
 _GENERIC_SOURCE_PATTERNS = [
     r"^internet$", r"^google$", r"^web$", r"^social media$", r"^redes sociales$",
@@ -114,6 +121,16 @@ def validate_evidence_quality(lead: Lead) -> ValidationResult:
             "decision-maker(s) were found but not recorded, which silently loses them."
         )
 
+    # v4.0 VAULT — defense in depth: re-run the same keyword cross-check the
+    # gate uses (scoring.decision_maker_phone_is_verified) here too, so a
+    # lead that somehow reaches validation with a mis-tagged Owner Contact
+    # Role still gets caught, with a message naming exactly why.
+    primary_role_contradictions = role_contradicts_evidence(
+        lead.owner_contact_role, lead.owner_role, lead.owner_phone_source,
+        lead.owner_phone_evidence, lead.owner_phone_discrepancy,
+    )
+    errors.extend(primary_role_contradictions)
+
     for person in lead.decision_makers:
         if person.phone_confidence in ("DIRECT", "NAMED_ATTRIBUTION") and person.phone_source and \
                 _matches_any(person.phone_source, _GENERIC_SOURCE_PATTERNS):
@@ -121,5 +138,10 @@ def validate_evidence_quality(lead: Lead) -> ValidationResult:
                 f"Decision maker '{person.name}' has confidence '{person.phone_confidence}' but a generic "
                 f"phone source ('{person.phone_source}') — confidence that high requires a specific source."
             )
+        person_role_contradictions = role_contradicts_evidence(
+            person.contact_role, person.role, person.phone_source, person.phone_evidence, person.phone_discrepancy,
+        )
+        for msg in person_role_contradictions:
+            errors.append(f"Decision maker '{person.name}': {msg}")
 
     return ValidationResult(ok=(len(errors) == 0), warnings=warnings, errors=errors)

@@ -1,10 +1,10 @@
 """
-NODOTO LEAD HUNTER — qualification gate + scoring (v3).
+NODOTO LEAD HUNTER — qualification gate + scoring (v4.0 "VAULT").
 
-Audit finding this version fixes: the old scoring blended "is this a good
-business to sell to" and "can we actually reach the decision-maker" into one
-number, so a great business with only a switchboard number scored the same
-contactability as one with a verified direct line. v3 keeps them separate:
+Audit finding v3 fixed: the old scoring blended "is this a good business to
+sell to" and "can we actually reach the decision-maker" into one number, so a
+great business with only a switchboard number scored the same contactability
+as one with a verified direct line. v3 keeps them separate:
 
   LEAD QUALITY    = is this business worth pursuing at all (money, need, gap)
   CONTACT QUALITY = can we actually reach the person who decides
@@ -13,6 +13,22 @@ The gate is still stricter than either score: a lead can never reach
 QUALIFIED without a decision-maker phone at DIRECT or NAMED_ATTRIBUTION
 confidence, no matter how high Lead Quality is (playbook rules #6, #21, #22,
 extended in v3 to also require the decision-maker still be current/in-charge).
+
+v4.0 fixes the critical failure the user reported directly (2026-09-15):
+`phone_confidence` (DIRECT/NAMED_ATTRIBUTION/...) only measures how solid the
+evidence is that a phone belongs to a NAMED PERSON — it says nothing about
+whether that person is actually the owner/decision-maker rather than a
+receptionist, secretary, scheduler, call-center agent, or a general business
+line. A receptionist's own extension, proven with excellent evidence, still
+scored DIRECT before this change. `decision_maker_phone_is_verified()` now
+ALSO hard-requires `contact_role` (schema.py) to be a decision-maker role —
+`UNKNOWN` or any staff role fails the gate exactly like a missing phone — and
+cross-checks the claim against the evidence text itself via
+`role_guard.role_contradicts_evidence()`, so a mis-tagged `contact_role`
+cannot ride through on a mistaken label. This is deliberately biased toward
+false negatives: "Prefiero perder 10 leads antes que recibir 10 números de
+recepción" (the user's own words). See `docs/owner_phone_vault_v4.md` in the
+memory repo for the full root-cause analysis.
 """
 
 from __future__ import annotations
@@ -27,7 +43,10 @@ from schema import (
     VERIFICATION_STATUS_VERIFIED, VERIFICATION_STATUS_CONTRADICTED,
     QUALIFICATION_STATUS_QUALIFIED, QUALIFICATION_STATUS_OWNER_PHONE_MISSING,
     QUALIFICATION_STATUS_DISCARDED,
+    ALL_CONTACT_ROLE_TYPES, DECISION_MAKER_CONTACT_ROLES, NON_DECISION_MAKER_CONTACT_ROLES,
+    CONTACT_ROLE_UNKNOWN,
 )
+from role_guard import role_contradicts_evidence
 
 LEAD_QUALITY_WEIGHTS = {
     "high_ticket_score": 0.45,
@@ -85,7 +104,57 @@ def decision_maker_phone_is_verified(lead: Lead) -> bool:
     if lead.is_verified("business_phone") and lead.owner_phone.strip() == lead.business_phone.strip():
         if confidence not in VALID_OWNER_PHONE_CONFIDENCE or "owner" not in (lead.owner_phone_source or "").lower():
             return False
+
+    # --- v4.0 VAULT: a strong phone-evidence tier is worthless if the person
+    # answering isn't the decision-maker. `contact_role` is mandatory and
+    # must be an actual decision-maker role — UNKNOWN (unclassified) and any
+    # explicit staff role (reception/secretary/scheduling/call-center/
+    # general-WhatsApp/business-line) fail exactly like a missing phone. ---
+    contact_role = (lead.owner_contact_role or "").strip().upper()
+    if contact_role not in DECISION_MAKER_CONTACT_ROLES:
+        return False
+
+    # Second, independent line of defense: even a correctly-tagged
+    # decision-maker role is rejected if the phone's own source/evidence
+    # text names a staff/generic-line signal — never trust the tag blindly.
+    if role_contradicts_evidence(
+        contact_role, lead.owner_role, lead.owner_phone_source,
+        lead.owner_phone_evidence, lead.owner_phone_discrepancy,
+    ):
+        return False
+
     return True
+
+
+def owner_contact_role_rejection_reason(lead: Lead) -> str | None:
+    """Human-readable reason `decision_maker_phone_is_verified` failed
+    specifically on the v4.0 vault check, or None if that's not why. Kept
+    separate from `decision_maker_phone_is_verified` (which stays a plain
+    bool) so `run_qualification_gate` can surface a reason that names the
+    actual problem — "receptionist number" — instead of the generic "phone
+    missing" message, per the user's explicit ask to document this clearly."""
+    contact_role = (lead.owner_contact_role or "").strip().upper()
+    if contact_role in NON_DECISION_MAKER_CONTACT_ROLES:
+        return (
+            f"Owner Contact Role is '{contact_role}' — a receptionist/secretary/scheduler/call-center/"
+            "general-WhatsApp/business-line contact is never eligible as the qualifying Owner Phone, "
+            "no matter the phone-evidence tier (vault rule v4.0). Find the actual owner/decision-maker's "
+            "own number, or leave this lead as OWNER_PHONE_MISSING."
+        )
+    if contact_role == CONTACT_ROLE_UNKNOWN or contact_role not in ALL_CONTACT_ROLE_TYPES:
+        return (
+            "Owner Contact Role is not classified (UNKNOWN) — vault rule v4.0 treats an unclassified "
+            "contact exactly like a missing phone. Classify who actually answers this number "
+            "(owner/founder, partner, director/manager, other decision-maker, or sole practitioner) "
+            "before this phone can count as Owner Phone."
+        )
+    contradictions = role_contradicts_evidence(
+        contact_role, lead.owner_role, lead.owner_phone_source,
+        lead.owner_phone_evidence, lead.owner_phone_discrepancy,
+    )
+    if contradictions:
+        return "; ".join(contradictions)
+    return None
 
 
 owner_phone_is_verified = decision_maker_phone_is_verified
@@ -165,6 +234,9 @@ def _validate_enum_fields(lead: Lead) -> list[str]:
     if lead.owner_authority_level and lead.owner_authority_level.strip().upper() not in ALL_AUTHORITY_LEVELS:
         errors.append(f"Owner Authority Level '{lead.owner_authority_level}' is not recognized "
                       f"(expected one of {sorted(ALL_AUTHORITY_LEVELS)})")
+    if lead.is_verified("owner_contact_role") and lead.owner_contact_role.strip().upper() not in ALL_CONTACT_ROLE_TYPES:
+        errors.append(f"Owner Contact Role '{lead.owner_contact_role}' is not a recognized value "
+                      f"(expected one of {sorted(ALL_CONTACT_ROLE_TYPES)})")
     if lead.is_verified("owner_phone") and not phone_format_is_plausible(lead.owner_phone):
         errors.append(f"Owner Phone '{lead.owner_phone}' does not look like a valid Colombian number "
                       f"after normalization — check for a transcription error before accepting it")
@@ -184,6 +256,10 @@ def run_qualification_gate(lead: Lead) -> GateResult:
             reason = "Identified decision-maker is no longer current (sold/left/retired) — needs a current one"
         elif (lead.owner_verification_status or "").strip().upper() == VERIFICATION_STATUS_CONTRADICTED:
             reason = "Owner Phone has unresolved contradicting sources (see Owner Phone Discrepancy)"
+        else:
+            vault_reason = owner_contact_role_rejection_reason(lead)
+            if vault_reason:
+                reason = vault_reason
         return GateResult(passed=False, status=QUALIFICATION_STATUS_OWNER_PHONE_MISSING, reasons=[reason])
 
     for field_name in REQUIRED_FOR_QUALIFIED:
