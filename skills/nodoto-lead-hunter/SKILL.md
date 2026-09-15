@@ -59,8 +59,12 @@ description: High-ticket sales opportunity engine for NODOTO AGENCY. Discovers B
 >    inferidos/adivinados.
 > 8. **Formato de salida limpio** (una fila = respuesta completa): `Empresa |
 >    Decisor principal | Otros decisores | Teléfono decisor | Confidence |
->    Web | Problema | Redes | Ángulo | Notas` — generado automáticamente por
->    `report.build_clean_export_table()`, nunca a mano.
+>    Sitio Web (URL) | Qué decirle en la llamada | Redes | Ángulo | Notas` —
+>    generado automáticamente por `report.build_clean_export_table()`, nunca a
+>    mano. **v3.2: siempre un archivo por nicho** — ver
+>    `build_clean_export_tables_by_niche()` — y la columna "Qué decirle en la
+>    llamada" es el gancho de llamada en frío (`cold_call_hook`), no el
+>    hallazgo técnico crudo — ver `references/cold_call_style_guide.md`.
 > 9. **Meta operativa: 30-50 leads extremadamente calificados/día — pero
 >    calidad sobre cantidad.** Si un día solo hay 12 que de verdad califican,
 >    se entregan 12. Nunca se rellena con leads débiles ni teléfonos
@@ -120,6 +124,46 @@ description: High-ticket sales opportunity engine for NODOTO AGENCY. Discovers B
 >    evidencia que cualquier otra fuente — nunca se eleva automáticamente a
 >    DIRECT/NAMED_ATTRIBUTION solo porque vino de Clay. Si Clay no está
 >    disponible, la corrida sigue exactamente igual sin él.
+
+> ## ACTUALIZACIÓN v3.2 (2026-09-15) — un archivo por nicho, y un gancho de llamada en frío
+>
+> Directiva explícita del usuario tras revisar el primer Excel entregado. Dos
+> cambios, ambos obligatorios de aquí en adelante:
+>
+> 1. **El export limpio / el .xlsx final NUNCA mezcla nichos — uno por
+>    archivo, siempre.** Un run puede seguir descubriendo/investigando 2-4
+>    nichos en paralelo por eficiencia (eso no cambia), pero el momento de
+>    entregar es distinto del momento de investigar: `report.py` ahora expone
+>    `split_leads_by_niche()` / `build_clean_export_tables_by_niche()`, y
+>    `cli.py run` escribe automáticamente `clean_export_<nicho>_<run>.csv` —
+>    uno por cada nicho presente en los leads calificados, nunca un solo CSV
+>    combinado. **Quien construya el .xlsx final a partir de esos CSV debe
+>    generar un archivo de Excel por nicho** (mismo nombre de nicho en el
+>    archivo), y entregarlos como archivos separados — nunca un único libro
+>    con pestañas por nicho ni una sola hoja con la columna "Niche" mezclada.
+>    Si un mismo run produce leads calificados en, por ejemplo, "Dermatólogos"
+>    y "Abogados corporativos", eso son DOS archivos entregables, no uno.
+> 2. **Nuevo campo `cold_call_hook` (columna "Qué decirle en la llamada" en
+>    el export limpio), pensado para maximizar la tasa de reuniones
+>    agendadas.** `website_problem`/`website_evidence` siguen existiendo sin
+>    cambios (evidencia técnica verificable, exigida por el gate) — pero
+>    ahora cada lead calificado también lleva una frase corta (2-3 oraciones),
+>    en segunda persona, dirigida al dueño del negocio, redactada como si se
+>    fuera a decir casi textual en una llamada en frío: abre con curiosidad
+>    genuina (no acusación), traduce el hallazgo técnico a impacto de negocio
+>    (clientes/citas que se pierden, no jerga como "404" o "sin SSL"), y
+>    cierra con un puente suave hacia agendar una llamada corta. **Nunca
+>    inventa nada que no esté ya en `website_problem`/`website_evidence`** —
+>    es un cambio de voz, no de contenido. Ver la guía completa con ejemplos
+>    y tabla de traducción hallazgo→impacto en
+>    `references/cold_call_style_guide.md` — LÉELA antes de escribir el
+>    primer `cold_call_hook` de una corrida. Si un lead no califica (sin
+>    decisor con teléfono DIRECT/NAMED_ATTRIBUTION), no se genera gancho de
+>    venta para él. `report.py` incluye un `_fallback_cold_call_hook()`
+>    puramente mecánico como red de seguridad para datos investigados antes
+>    de este cambio — produce frases correctas pero mecánicas; el sub-agente
+>    que investiga cada lead debe escribir el suyo a mano siguiendo la guía,
+>    nunca depender del fallback a propósito.
 
 # NODOTO LEAD HUNTER
 
@@ -319,6 +363,24 @@ Bad: `Website is bad.`
 Good: `The homepage has no clear primary CTA above the fold and the only
 contact path is a generic phone number in the footer.`
 
+Record `Website` as the actual, current, live URL you audited (following any
+redirect to the real domain in use today — e.g. an old domain that 302s to a
+new one is NOT the value to record, the destination is). If there is no
+website, `Website Status = "no_website"` and leave `Website` as `NOT_VERIFIED`
+— never a placeholder URL.
+
+**v3.2 — also write `cold_call_hook` here, same step, while the evidence is
+fresh** (only for leads that will end up qualifying — DIRECT/NAMED_ATTRIBUTION
+decision-maker phone). This is the SAME `website_problem`/`website_evidence`
+finding, rewritten as 2-3 spoken sentences in second person, addressed to the
+business owner, built to be read almost verbatim on a cold call and to
+maximize the booked-meeting rate — never a new fact beyond what's already in
+`website_problem`/`website_evidence`. Read
+`references/cold_call_style_guide.md` before writing the first one of a run —
+it has the full structure (curiosity opener → business-impact translation →
+soft bridge to a short call), tone guidance, and a translation table from
+common technical findings to business-impact phrasing.
+
 ### 6. Social discovery
 
 Find and verify (don't guess) official Instagram, Facebook, LinkedIn, TikTok
@@ -421,11 +483,17 @@ python3 skills/nodoto-lead-hunter/scripts/cli.py run candidates.json \
 This validates each candidate, dedupes against the repo's CSVs (+ the Sheet
 export if provided, + decision-maker reuse across the whole memory) AND
 against other candidates in the same batch, runs the qualification gate and
-evidence-quality check, writes `qualified_leads_<run>.csv`,
-`candidates_owner_phone_missing_<run>.csv`, and `clean_export_<run>.csv` (the
-exact one-row-per-lead answer table), and prints the fixed-format run report
-— with discard/duplicate/reuse-flag reasons on stderr for auditing. To rank
-niches before picking one:
+evidence-quality check, writes `qualified_leads_<run>.csv` and
+`candidates_owner_phone_missing_<run>.csv`, prints the fixed-format run
+report, and — **v3.2, one file per niche, never combined** — writes
+`clean_export_<nicho_slug>_<run>.csv` once per distinct niche present in the
+qualified leads (e.g. `clean_export_dermatologos_de_tratamientos_laser_<run>.csv`
+and `clean_export_abogados_corporativos_<run>.csv` from the same run, as two
+separate files, if that run qualified leads in both niches). Whoever builds
+the final `.xlsx` deliverable from these must produce one workbook per niche
+CSV — never merge them into one file or one multi-tab workbook. With
+discard/duplicate/reuse-flag reasons on stderr for auditing. To rank niches
+before picking one:
 
 ```bash
 python3 skills/nodoto-lead-hunter/scripts/cli.py rank-niches --repo-root .
@@ -443,8 +511,11 @@ skill's own CLI entrypoint; only an actual `cli.py run` invocation did.
 
 ### 11. Report
 
-Render with `scripts/report.py` (`render_report` for the fixed-format summary,
-`build_clean_export_table` for the one-row-per-lead answer table). See
+Render with `scripts/report.py` (`render_report` for the fixed-format summary;
+`build_clean_export_tables_by_niche` for the one-row-per-lead answer table,
+pre-split by niche — v3.2, use this instead of the single-table
+`build_clean_export_table` whenever the output will be delivered as a file,
+so a multi-niche run can never accidentally produce one mixed file). See
 `report.py`'s `RunStats.from_qualified()` for deriving the v3 quality-breakdown
 fields automatically from the qualified leads.
 
@@ -495,10 +566,17 @@ entry, not mixed into the cold-email run log.
   owner-access rate.
 - `scripts/sheets_io.py` — Sheets write-plan/verify contract + CSV fallback writer.
 - `scripts/report.py` — fixed-format run report + the exact one-row-per-lead
-  clean export table.
+  clean export table, split by niche (v3.2 — `split_leads_by_niche`,
+  `build_clean_export_tables_by_niche`, `niche_slug`), plus `cold_call_hook`
+  handling (`_fallback_cold_call_hook` for older data).
 - `scripts/cli.py` — single entrypoint running dedupe → gate → validate →
-  score → write → report over a JSON candidates file.
+  score → write → report over a JSON candidates file; writes one
+  `clean_export_<nicho>_<run>.csv` per niche (v3.2).
 - `references/composio_tools.md` — exact Composio call sequence + account-verification steps.
+- `references/cold_call_style_guide.md` — v3.2: how to write `cold_call_hook`
+  (structure, tone, a technical-finding → business-impact translation table,
+  worked examples) so the clean export reads as a call-ready script, not a
+  technical audit note.
 - `tests/test_pipeline.py` — the 8 mandated E2E scenarios (single/multi
   decision-maker, generic/verified-business-only phone rejection,
   named-attribution, contradictory sources, no-website, multi-location,
