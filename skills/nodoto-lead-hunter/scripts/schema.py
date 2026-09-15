@@ -13,6 +13,39 @@ decision-maker. `decision_makers_json` carries the FULL list this run found
 `owner_*` fields are kept for backward compatibility and ARE the mirror of the
 PRIORITIZED PRIMARY decision-maker — they are what dedupe.py/scoring.py's gate
 actually operate on, so existing call sites did not need to change shape.
+
+v4.0 change (user directive, 2026-09-15 — "VAULT" upgrade): root-cause fix for
+a critical failure the user reported directly: the pipeline was delivering
+"Owner Phone" numbers that actually belonged to receptionists, secretaries,
+scheduling/appointment lines, call centers, general customer-service WhatsApp,
+or generic business lines — never the owner/decision-maker. See
+`docs/owner_phone_vault_v4.md` in the memory repo for the full root-cause
+analysis. The root cause: `owner_phone_confidence` (DIRECT/NAMED_ATTRIBUTION/
+...) measures how solid the evidence is that a PHONE belongs to a NAMED
+PERSON — it says nothing about whether that named person is actually the
+decision-maker rather than staff. A receptionist's own direct extension,
+proven with excellent evidence, still scored DIRECT. `owner_authority_level`
+existed but only affected the Contact Quality *score* — it was never a gate
+requirement, so a lead could sail through the gate with `Owner Authority
+Level = UNKNOWN` as long as the phone-evidence tier was high.
+
+The fix adds a SEPARATE, mandatory classification of WHO the phone actually
+reaches — `Owner Contact Role` (`contact_role` on each `DecisionMaker`) — with
+its own vocabulary that a phone-evidence tier can never override:
+decision-maker roles (`OWNER_FOUNDER`, `PARTNER`, `DIRECTOR_MANAGER`,
+`DECISION_MAKER_OTHER`, `SOLE_PRACTITIONER`) vs. staff/non-decision-maker
+roles (`RECEPTION`, `SECRETARY`, `SCHEDULING`, `CALL_CENTER`,
+`GENERAL_WHATSAPP`, `BUSINESS_LINE`) vs. `UNKNOWN` (not yet classified).
+`scoring.decision_maker_phone_is_verified()` now HARD-REQUIRES the primary
+decision-maker's `contact_role` to be in the decision-maker set — `UNKNOWN`
+is treated exactly like a missing phone, never a pass. It is deliberately
+biased toward false negatives over false positives, per the user's explicit
+instruction: "Prefiero perder 10 leads antes que recibir 10 números de
+recepción." See `role_guard.py` for the keyword-based cross-check that also
+rejects a lead when the phone source/evidence text itself names reception/
+secretary/scheduling/call-center/WhatsApp-general/business-line signals, even
+if a sub-agent mis-tagged `contact_role` as a decision-maker role — a defense
+against the tag itself being wrong, not just against it being missing.
 """
 
 from __future__ import annotations
@@ -22,7 +55,7 @@ from typing import Optional
 
 COLUMNS = [
     "Business Name", "Niche", "Sub-Niche", "City", "Neighborhood", "Address", "Google Maps",
-    "Owner Name", "Owner Role", "Owner Authority Level", "Owner Is Current",
+    "Owner Name", "Owner Role", "Owner Authority Level", "Owner Contact Role", "Owner Is Current",
     "Owner Phone", "Owner Phone Source", "Owner Phone Evidence", "Owner Phone Confidence",
     "Owner Phone Discrepancy", "Owner Verification Status",
     "Owner LinkedIn", "Owner Instagram", "Owner Email",
@@ -37,8 +70,8 @@ COLUMNS = [
 
 REQUIRED_FOR_QUALIFIED = [
     "Business Name", "Niche", "City",
-    "Owner Name", "Owner Role", "Owner Phone", "Owner Phone Source", "Owner Phone Evidence",
-    "Owner Phone Confidence", "Owner Verification Status",
+    "Owner Name", "Owner Role", "Owner Contact Role", "Owner Phone", "Owner Phone Source",
+    "Owner Phone Evidence", "Owner Phone Confidence", "Owner Verification Status",
     "Website Problem", "Website Evidence",
 ]
 
@@ -66,6 +99,39 @@ AUTHORITY_INFLUENCER = "INFLUENCER"
 AUTHORITY_UNKNOWN = "UNKNOWN"
 ALL_AUTHORITY_LEVELS = {AUTHORITY_FINAL, AUTHORITY_INFLUENCER, AUTHORITY_UNKNOWN}
 
+# --- v4.0 "VAULT" — Owner Contact Role taxonomy ----------------------------
+# WHO actually answers this phone, as opposed to how solid the evidence is
+# that a phone belongs to a named person (that's `phone_confidence`, above).
+# A receptionist's own personal cell, proven with perfect evidence, is still
+# a receptionist's phone — never eligible as "Owner Phone". See the v4.0 note
+# at the top of this file and `role_guard.py`.
+CONTACT_ROLE_OWNER_FOUNDER = "OWNER_FOUNDER"
+CONTACT_ROLE_PARTNER = "PARTNER"
+CONTACT_ROLE_DIRECTOR_MANAGER = "DIRECTOR_MANAGER"
+CONTACT_ROLE_DECISION_MAKER_OTHER = "DECISION_MAKER_OTHER"
+CONTACT_ROLE_SOLE_PRACTITIONER = "SOLE_PRACTITIONER"
+
+CONTACT_ROLE_RECEPTION = "RECEPTION"
+CONTACT_ROLE_SECRETARY = "SECRETARY"
+CONTACT_ROLE_SCHEDULING = "SCHEDULING"
+CONTACT_ROLE_CALL_CENTER = "CALL_CENTER"
+CONTACT_ROLE_GENERAL_WHATSAPP = "GENERAL_WHATSAPP"
+CONTACT_ROLE_BUSINESS_LINE = "BUSINESS_LINE"
+
+CONTACT_ROLE_UNKNOWN = "UNKNOWN"
+
+# Eligible as the qualifying "Owner Phone" contact.
+DECISION_MAKER_CONTACT_ROLES = {
+    CONTACT_ROLE_OWNER_FOUNDER, CONTACT_ROLE_PARTNER, CONTACT_ROLE_DIRECTOR_MANAGER,
+    CONTACT_ROLE_DECISION_MAKER_OTHER, CONTACT_ROLE_SOLE_PRACTITIONER,
+}
+# Explicitly staff/generic — never eligible, no matter the phone-evidence tier.
+NON_DECISION_MAKER_CONTACT_ROLES = {
+    CONTACT_ROLE_RECEPTION, CONTACT_ROLE_SECRETARY, CONTACT_ROLE_SCHEDULING,
+    CONTACT_ROLE_CALL_CENTER, CONTACT_ROLE_GENERAL_WHATSAPP, CONTACT_ROLE_BUSINESS_LINE,
+}
+ALL_CONTACT_ROLE_TYPES = DECISION_MAKER_CONTACT_ROLES | NON_DECISION_MAKER_CONTACT_ROLES | {CONTACT_ROLE_UNKNOWN}
+
 NOT_VERIFIED = "NOT_VERIFIED"
 NOT_VERIFIED_ALIASES = {
     "NOT_VERIFIED", "NO_VERIFIED", "N/A", "NA", "", "NONE", "UNKNOWN", "TBD", "NOT FOUND", "NOT_FOUND",
@@ -86,6 +152,7 @@ class DecisionMaker:
     name: str = NOT_VERIFIED
     role: str = NOT_VERIFIED
     authority_level: str = AUTHORITY_UNKNOWN
+    contact_role: str = CONTACT_ROLE_UNKNOWN
     is_current: bool = True
     phone: str = NOT_VERIFIED
     phone_confidence: str = PHONE_CONFIDENCE_UNKNOWN
@@ -100,6 +167,7 @@ class DecisionMaker:
     def to_dict(self) -> dict:
         return {
             "name": self.name, "role": self.role, "authority_level": self.authority_level,
+            "contact_role": self.contact_role,
             "is_current": self.is_current, "phone": self.phone,
             "phone_confidence": self.phone_confidence, "phone_source": self.phone_source,
             "phone_evidence": self.phone_evidence, "phone_discrepancy": self.phone_discrepancy,
@@ -128,6 +196,7 @@ class Lead:
     owner_name: str = NOT_VERIFIED
     owner_role: str = NOT_VERIFIED
     owner_authority_level: str = AUTHORITY_UNKNOWN
+    owner_contact_role: str = CONTACT_ROLE_UNKNOWN
     owner_is_current: bool = True
     owner_phone: str = NOT_VERIFIED
     owner_phone_source: str = NOT_VERIFIED
@@ -178,6 +247,7 @@ class Lead:
             self.owner_name = NOT_VERIFIED
             self.owner_role = NOT_VERIFIED
             self.owner_authority_level = AUTHORITY_UNKNOWN
+            self.owner_contact_role = CONTACT_ROLE_UNKNOWN
             self.owner_is_current = True
             self.owner_phone = NOT_VERIFIED
             self.owner_phone_source = NOT_VERIFIED
@@ -191,6 +261,7 @@ class Lead:
         self.owner_name = primary.name
         self.owner_role = primary.role
         self.owner_authority_level = primary.authority_level
+        self.owner_contact_role = primary.contact_role
         self.owner_is_current = primary.is_current
         self.owner_phone = primary.phone
         self.owner_phone_source = primary.phone_source
@@ -229,6 +300,7 @@ class Lead:
             "Google Maps": self.google_maps,
             "Owner Name": self.owner_name, "Owner Role": self.owner_role,
             "Owner Authority Level": self.owner_authority_level,
+            "Owner Contact Role": self.owner_contact_role,
             "Owner Is Current": self.owner_is_current,
             "Owner Phone": self.owner_phone,
             "Owner Phone Source": self.owner_phone_source,
@@ -265,7 +337,8 @@ class Lead:
             "Business Name": "business_name", "Niche": "niche", "Sub-Niche": "sub_niche", "City": "city",
             "Neighborhood": "neighborhood", "Address": "address", "Google Maps": "google_maps",
             "Owner Name": "owner_name", "Owner Role": "owner_role",
-            "Owner Authority Level": "owner_authority_level", "Owner Is Current": "owner_is_current",
+            "Owner Authority Level": "owner_authority_level", "Owner Contact Role": "owner_contact_role",
+            "Owner Is Current": "owner_is_current",
             "Owner Phone": "owner_phone",
             "Owner Phone Source": "owner_phone_source",
             "Owner Phone Evidence": "owner_phone_evidence",
@@ -312,7 +385,8 @@ class Lead:
         elif lead.is_verified("owner_name"):
             lead.decision_makers = [DecisionMaker(
                 name=lead.owner_name, role=lead.owner_role,
-                authority_level=lead.owner_authority_level, is_current=lead.owner_is_current,
+                authority_level=lead.owner_authority_level, contact_role=lead.owner_contact_role,
+                is_current=lead.owner_is_current,
                 phone=lead.owner_phone, phone_source=lead.owner_phone_source,
                 phone_evidence=lead.owner_phone_evidence, phone_confidence=lead.owner_phone_confidence,
                 phone_discrepancy=lead.owner_phone_discrepancy,
