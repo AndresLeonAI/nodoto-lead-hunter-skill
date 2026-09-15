@@ -46,7 +46,10 @@ from dedupe import (  # noqa: E402
 from scoring import run_qualification_gate  # noqa: E402
 from validate import validate_evidence_quality  # noqa: E402
 from sheets_io import write_csv_mirror  # noqa: E402
-from report import RunStats, render_report, build_clean_export_table, CLEAN_EXPORT_HEADERS  # noqa: E402
+from report import (  # noqa: E402
+    RunStats, render_report, CLEAN_EXPORT_HEADERS,
+    build_clean_export_tables_by_niche, niche_slug,
+)
 from niche_priority import rank_niches, estimate_raw_candidates_needed  # noqa: E402
 
 
@@ -137,9 +140,16 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(render_report(stats))
 
     if qualified:
-        clean_path = out_dir / f"clean_export_{Path(paths['qualified_csv']).stem.split('_', 2)[-1]}.csv"
-        _write_clean_export(clean_path, qualified)
-        print(f"\nExportacion limpia (tabla de una fila por lead): {clean_path}", file=sys.stderr)
+        run_suffix = Path(paths["qualified_csv"]).stem.split("_", 2)[-1]
+        # v3.2: never mix niches in one clean export / one .xlsx — one file
+        # per niche, even when this run's `qualified` list spans several
+        # niches researched in parallel. See report.split_leads_by_niche().
+        by_niche = build_clean_export_tables_by_niche(qualified)
+        print("\nExportacion limpia (una tabla por nicho, nunca mezclada):", file=sys.stderr)
+        for niche, rows in by_niche.items():
+            clean_path = out_dir / f"clean_export_{niche_slug(niche)}_{run_suffix}.csv"
+            _write_clean_export_rows(clean_path, rows)
+            print(f"  [{niche}] ({len(rows)} lead(s)): {clean_path}", file=sys.stderr)
 
     if discarded:
         print("\n--- DISCARDED (reasons) ---", file=sys.stderr)
@@ -153,9 +163,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
-def _write_clean_export(path: Path, qualified: list[Lead]) -> None:
+def _write_clean_export_rows(path: Path, rows: list[dict]) -> None:
     import csv as _csv
-    rows = build_clean_export_table(qualified)
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = _csv.DictWriter(f, fieldnames=CLEAN_EXPORT_HEADERS)
         writer.writeheader()

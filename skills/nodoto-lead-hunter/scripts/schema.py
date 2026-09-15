@@ -32,7 +32,7 @@ COLUMNS = [
     "High Ticket Score", "Website Opportunity Score", "Data Quality Score",
     "Lead Quality Score", "Contact Quality Score",
     "Lead Score", "Lead Tier", "Qualification Status",
-    "Research Date", "Sources", "Notes", "Angle",
+    "Research Date", "Sources", "Notes", "Angle", "Cold Call Hook",
 ]
 
 REQUIRED_FOR_QUALIFIED = [
@@ -164,6 +164,7 @@ class Lead:
     sources: str = ""
     notes: str = ""
     angle: str = ""
+    cold_call_hook: str = NOT_VERIFIED
 
     def is_verified(self, field_name: str) -> bool:
         val = getattr(self, field_name, "")
@@ -254,7 +255,7 @@ class Lead:
             "Lead Score": self.lead_score, "Lead Tier": self.lead_tier,
             "Qualification Status": self.qualification_status,
             "Research Date": self.research_date, "Sources": self.sources, "Notes": self.notes,
-            "Angle": self.angle,
+            "Angle": self.angle, "Cold Call Hook": self.cold_call_hook,
         }
         return [mapping.get(c, "") for c in columns]
 
@@ -284,6 +285,7 @@ class Lead:
             "Lead Score": "lead_score", "Lead Tier": "lead_tier",
             "Qualification Status": "qualification_status", "Research Date": "research_date",
             "Sources": "sources", "Notes": "notes", "Angle": "angle",
+            "Cold Call Hook": "cold_call_hook",
         }
         decision_makers_raw = d.get("Decision Makers JSON") or d.get("decision_makers_json")
         decision_makers_list = d.get("decision_makers")

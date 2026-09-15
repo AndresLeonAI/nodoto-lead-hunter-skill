@@ -1,11 +1,30 @@
 """
-NODOTO LEAD HUNTER — final run report + clean export table (v3).
+NODOTO LEAD HUNTER — final run report + clean export table (v3.2).
+
+v3.2 change (user directive, 2026-09-15): the clean export / Excel deliverable
+must always be split ONE FILE PER NICHE — a single spreadsheet may never mix
+leads from two different niches, even when a run discovered/researched
+several niches in parallel for efficiency. `split_leads_by_niche()` and
+`build_clean_export_tables_by_niche()` below are what enforce that at the
+data layer; the caller (cli.py, or whoever builds the final .xlsx) must loop
+over the returned dict and produce one file per key, never one combined file.
+
+v3.2 also adds `Lead.cold_call_hook`: a literal, conversational line an SDR
+can read (almost) verbatim on a cold call, addressed to the business owner in
+second person, built from the SAME verified `website_problem`/`website_evidence`
+already required for the qualification gate — never new invented specifics.
+It exists to raise the booked-meeting rate, not to replace `angle` (which
+stays a short strategist's note TO the seller about pitch positioning).
+`_fallback_cold_call_hook()` derives a serviceable one from the technical
+fields for leads researched before this field existed.
 """
 
 from __future__ import annotations
+import re
+import unicodedata
 from dataclasses import dataclass, field
 
-from schema import Lead
+from schema import Lead, NOT_VERIFIED_ALIASES
 
 
 @dataclass
@@ -130,16 +149,39 @@ def render_report(stats: RunStats) -> str:
 
 CLEAN_EXPORT_HEADERS = [
     "Empresa", "Decisor principal", "Otros decisores", "Teléfono decisor",
-    "Confidence", "Web", "Problema", "Redes", "Ángulo", "Notas",
+    "Confidence", "Sitio Web (URL)", "Qué decirle en la llamada", "Redes", "Ángulo", "Notas",
 ]
+
+
+def _is_verified_text(value: str) -> bool:
+    return bool(value) and str(value).strip().upper() not in NOT_VERIFIED_ALIASES
+
+
+def _fallback_cold_call_hook(lead: Lead) -> str:
+    """Best-effort conversational rewrite for leads researched before
+    `cold_call_hook` existed (or where an agent forgot to fill it in).
+    Never invents anything beyond `website_problem`/`website_evidence` —
+    it only changes VOICE (third person technical -> second person spoken),
+    so it stays inside the same evidence already required by the gate."""
+    if not _is_verified_text(lead.website_problem):
+        return "N/A (sin sitio web o sin problema verificado — no forzar un gancho de llamada)"
+    problem = lead.website_problem.strip()
+    # Lowercase the first letter only if the sentence doesn't start with a
+    # proper noun/acronym, so the stitched sentence still reads naturally.
+    lead_in = problem[0].lower() + problem[1:] if problem and problem[0].isupper() else problem
+    return (
+        f"Cuando entré a su sitio noté que {lead_in} "
+        "— eso puede estarle costando clientes que no llegan a agendar. "
+        "¿Tiene 15 minutos esta semana para mostrarle exactamente qué está pasando y cómo se arregla?"
+    )
 
 
 def build_clean_export_row(lead: Lead) -> dict:
     decisor = f"{lead.owner_name} — {lead.owner_role}" if lead.is_verified("owner_name") else "NOT FOUND"
     if lead.owner_authority_level and lead.owner_authority_level not in ("UNKNOWN", ""):
         decisor += f" ({lead.owner_authority_level})"
-    web = lead.website if lead.is_verified("website") else ("Sin sitio web" if lead.website_status == "no_website" else "NOT FOUND")
-    problema = lead.website_problem if lead.is_verified("website_problem") else "N/A"
+    web = lead.website if lead.is_verified("website") else ("N/A (sin sitio web)" if lead.website_status == "no_website" else "NOT FOUND")
+    gancho = lead.cold_call_hook if _is_verified_text(lead.cold_call_hook) else _fallback_cold_call_hook(lead)
     redes = ", ".join(
         v for v in (lead.instagram, lead.facebook, lead.linkedin, lead.owner_instagram, lead.owner_linkedin)
         if v and v.upper() != "NOT_VERIFIED"
@@ -151,8 +193,8 @@ def build_clean_export_row(lead: Lead) -> dict:
         "Otros decisores": lead.secondary_decision_makers_summary or "—",
         "Teléfono decisor": telefono,
         "Confidence": lead.owner_phone_confidence,
-        "Web": web,
-        "Problema": problema,
+        "Sitio Web (URL)": web,
+        "Qué decirle en la llamada": gancho,
         "Redes": redes,
         "Ángulo": lead.angle or "",
         "Notas": lead.notes or "",
@@ -161,3 +203,36 @@ def build_clean_export_row(lead: Lead) -> dict:
 
 def build_clean_export_table(leads: list[Lead]) -> list[dict]:
     return [build_clean_export_row(l) for l in leads]
+
+
+def niche_slug(niche: str) -> str:
+    """Filesystem/filename-safe slug for a niche name, used so one clean
+    export / one .xlsx per niche never collide or get overwritten."""
+    if not niche or not str(niche).strip():
+        return "sin_nicho"
+    text = unicodedata.normalize("NFKD", str(niche)).encode("ascii", "ignore").decode("ascii")
+    text = re.sub(r"[^a-zA-Z0-9]+", "_", text).strip("_").lower()
+    return text or "sin_nicho"
+
+
+def split_leads_by_niche(leads: list[Lead]) -> dict[str, list[Lead]]:
+    """Groups leads by their exact `niche` string. A single run may
+    discover/research several niches in parallel for efficiency, but the
+    deliverable (clean export / .xlsx) must never mix them — one file per
+    niche, always. Returns an ordered dict keyed by the niche name as it
+    appears on the leads (first-seen order), so callers can build one
+    output file per key without guessing niche names."""
+    groups: dict[str, list[Lead]] = {}
+    for lead in leads:
+        key = lead.niche if _is_verified_text(lead.niche) else "(nicho no especificado)"
+        groups.setdefault(key, []).append(lead)
+    return groups
+
+
+def build_clean_export_tables_by_niche(leads: list[Lead]) -> dict[str, list[dict]]:
+    """Same as `build_clean_export_table`, but pre-split by niche so the
+    caller can write/deliver one file per niche directly from the result."""
+    return {
+        niche: build_clean_export_table(niche_leads)
+        for niche, niche_leads in split_leads_by_niche(leads).items()
+    }
