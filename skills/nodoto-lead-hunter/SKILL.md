@@ -165,6 +165,79 @@ description: High-ticket sales opportunity engine for NODOTO AGENCY. Discovers B
 >    que investiga cada lead debe escribir el suyo a mano siguiendo la guía,
 >    nunca depender del fallback a propósito.
 
+> ## ACTUALIZACIÓN v4.0 (2026-09-15) — VAULT: cero tolerancia con teléfonos de
+> ## recepción/secretaria/agenda/call center presentados como Owner Phone
+>
+> Fallo crítico reportado directamente por el usuario: varios de los números
+> que el sistema entregaba como `Owner Phone` resultaban ser de
+> recepcionistas, secretarias, líneas de agenda/citas, call centers, WhatsApp
+> general de atención al cliente, o líneas empresariales genéricas — nunca el
+> dueño/decisor real. El usuario terminaba llamando confiando en que tenía el
+> contacto del dueño, y hablaba con una recepcionista. En sus propias
+> palabras: "Esto NO es un pequeño error de calidad. Es un fallo crítico del
+> sistema de captación." y "Prefiero perder 10 leads antes que recibir 10
+> números de recepción."
+>
+> **Causa raíz** (investigada primero, antes de tocar una sola línea de
+> código, por instrucción explícita del usuario): `Owner Phone Confidence`
+> (DIRECT/NAMED_ATTRIBUTION/...) mide qué tan sólida es la evidencia de que
+> un teléfono pertenece a una PERSONA NOMBRADA — nunca mide si esa persona es
+> realmente el dueño/decisor o solo personal (recepción, secretaria, agenda,
+> call center). La extensión propia de una recepcionista, con evidencia
+> perfecta ("el botón de WhatsApp del sitio abre este número, confirmado por
+> teléfono"), calificaba exactamente igual como `DIRECT` que el celular
+> personal del dueño — nada en el gate distinguía QUIÉN contesta. `Owner
+> Authority Level` ya existía pero solo alimentaba el score de Contact
+> Quality; nunca fue un requisito del gate, así que un lead podía calificar
+> con `Owner Authority Level = UNKNOWN` mientras el tier de evidencia del
+> teléfono fuera alto. Esa es la brecha exacta que este upgrade cierra — no
+> se trata de "buscar más", se trata de que el sistema nunca verificaba QUIÉN
+> es la persona detrás del número, solo qué tan bien probado estaba el
+> vínculo persona↔número.
+>
+> **Corrección** (implementada sobre la arquitectura existente — `schema.py`,
+> `scoring.py`, `validate.py` — nada se reescribió desde cero):
+>
+> 1. Nuevo campo obligatorio **`Owner Contact Role`** (`contact_role` en cada
+>    `DecisionMaker`, ver `schema.py`) — clasifica QUIÉN responde realmente
+>    ese número, con un vocabulario que el tier de evidencia del teléfono
+>    nunca puede pisar. Roles de decisor (elegibles): `OWNER_FOUNDER`,
+>    `PARTNER`, `DIRECTOR_MANAGER`, `DECISION_MAKER_OTHER`,
+>    `SOLE_PRACTITIONER`. Roles de personal/genéricos (NUNCA elegibles, sin
+>    importar el tier de confianza del teléfono): `RECEPTION`, `SECRETARY`,
+>    `SCHEDULING`, `CALL_CENTER`, `GENERAL_WHATSAPP`, `BUSINESS_LINE`.
+>    `UNKNOWN` (sin clasificar) se trata exactamente igual que un teléfono
+>    faltante.
+> 2. `scoring.decision_maker_phone_is_verified()` ahora EXIGE que `Owner
+>    Contact Role` del decisor principal esté en el conjunto de roles de
+>    decisor — un `UNKNOWN` o cualquier rol de personal hace fallar el gate
+>    igual que un teléfono ausente, sin importar si la confianza es DIRECT.
+> 3. Nuevo módulo `role_guard.py` — segunda línea de defensa, independiente
+>    de la etiqueta que puso el sub-agente: aunque `Owner Contact Role` se
+>    haya clasificado (correcta o incorrectamente) como decisor, si el texto
+>    de `Owner Role` / `Owner Phone Source` / `Owner Phone Evidence` / `Owner
+>    Phone Discrepancy` contiene señales bilingües de recepción, secretaria,
+>    agenda/citas, call center, WhatsApp general o línea empresarial, el lead
+>    se rechaza igual — nunca se confía ciegamente en la etiqueta.
+>    `validate.py` corre el mismo cruce como respaldo adicional antes de
+>    escribir a Qualified Leads (defensa en profundidad).
+> 4. Sesgo deliberado hacia falsos negativos: un caso ambiguo (`UNKNOWN`, o
+>    cualquier contradicción textual detectada) es un caso RECHAZADO —
+>    `OWNER_PHONE_MISSING` — nunca "calificado por si acaso". La razón de
+>    rechazo ahora nombra el problema explícitamente ("Owner Contact Role is
+>    'RECEPTION' — ... vault rule v4.0 ...") en vez de un mensaje genérico de
+>    "teléfono faltante", exactamente lo que el usuario pidió documentar.
+>
+> El root-cause completo, más ejemplos de antes/después y la tabla de
+> palabras clave bilingües usadas por `role_guard.py`, quedan documentados en
+> `docs/owner_phone_vault_v4.md` del repo de memoria — léelo antes de tocar
+> `scoring.py`, `validate.py` o `role_guard.py`. **Este cambio también afecta
+> los pasos 3-4 del pipeline (abajo): a partir de ahora, cada `DecisionMaker`
+> que se registre DEBE incluir `contact_role` explícito**, con la misma
+> disciplina de nunca inventar — si no se puede determinar con certeza si la
+> persona es decisor o personal, se clasifica `UNKNOWN` y el lead cae a
+> `OWNER_PHONE_MISSING`, nunca se adivina hacia "sí es el dueño".
+
 # NODOTO LEAD HUNTER
 
 A high-ticket sales opportunity engine, not a generic scraper. It exists to answer
@@ -205,6 +278,23 @@ Never: guess, infer, autocomplete, pad digits, use leaked/private databases, or
 silently relabel the business's generic phone as the owner's. If the same digits
 as the business line are the only thing found, that is **not** an owner phone
 unless there's explicit evidence the owner personally publishes that same number.
+
+**v4.0 VAULT — a phone belonging to a NAMED person is still not enough; the
+person must be the decision-maker, not staff.** A receptionist's own direct
+extension, a secretary's personal WhatsApp, a scheduling/appointments line, a
+call-center agent's number, general customer-service WhatsApp, or a generic
+business line are never an Owner Phone, no matter how solid the evidence is
+that the number belongs to that specific named person. Every decision-maker
+recorded MUST carry an explicit `Owner Contact Role` (`contact_role`):
+`OWNER_FOUNDER`, `PARTNER`, `DIRECTOR_MANAGER`, `DECISION_MAKER_OTHER`, or
+`SOLE_PRACTITIONER` to be eligible at all — `RECEPTION`, `SECRETARY`,
+`SCHEDULING`, `CALL_CENTER`, `GENERAL_WHATSAPP`, `BUSINESS_LINE`, or `UNKNOWN`
+(not yet classified) always fail the gate, regardless of phone confidence
+tier. When in doubt about whether the person you found is actually the
+decision-maker, classify `UNKNOWN` and let the lead fall to
+`OWNER_PHONE_MISSING` — never guess upward toward "probably the owner." See
+the ACTUALIZACIÓN v4.0 note above and `docs/owner_phone_vault_v4.md` in the
+memory repo.
 
 ## Pipeline
 
@@ -303,6 +393,19 @@ Administrador/propietario. Record each as a `DecisionMaker` in
 `decision_makers`, then rank by `priority` (see the v3 note above) — never
 collapse a multi-partner business into a single name.
 
+**v4.0 — classify `contact_role` for every person you record, right here,
+while you still know exactly where each name/title came from.** This is a
+judgment call, not a lookup: "Fundadora y Directora Médica" → `OWNER_FOUNDER`;
+"Socio Director" → `PARTNER` or `DIRECTOR_MANAGER` depending on which fits
+better; a solo professional running their own practice → `SOLE_PRACTITIONER`.
+If a search surfaces a name attached to "recepción", "secretaria", "agenda de
+citas", "call center", "atención al cliente", "línea de WhatsApp general", or
+similar — that person is `RECEPTION`/`SECRETARY`/`SCHEDULING`/`CALL_CENTER`/
+`GENERAL_WHATSAPP`/`BUSINESS_LINE`, never a decision-maker role, even if they
+answer the phone personally and even if their number is easy to verify.
+Genuinely unsure which bucket fits → `UNKNOWN`, and keep looking for a better
+candidate before falling back to `OWNER_PHONE_MISSING` for that lead.
+
 ### 4. Decision-maker phone discovery
 
 Once a decision-maker is named, search specifically:
@@ -316,6 +419,18 @@ Record `Owner Phone Source` with enough specificity to audit later (e.g.
 `Owner Phone Evidence` describing HOW the person↔number link was proven, not
 just where it was seen. See `docs/owner_phone_sources_v3.md` in the memory
 repo for the full 5-tier hierarchy and contradiction-handling protocol.
+
+**v4.0 — a strong person↔number link is not the same question as "is this
+person the decision-maker."** Before writing `Owner Phone Confidence`, ask
+separately: who actually picks up or reads messages on this number — the
+decision-maker personally, or staff relaying on their behalf? If the number
+you found is described anywhere in your own sources as a WhatsApp "de
+atención al cliente", a "línea de agenda/citas", a call center, a
+switchboard/PBX, or "recepción"/"secretaria" — write that into `Owner Phone
+Source`/`Owner Phone Evidence` honestly (never soften it to sound more
+qualifying) and set `contact_role` to the matching staff role; `role_guard.py`
+will also catch it from the text itself if you miss it. This is exactly the
+pattern that was silently qualifying before v4.0.
 
 #### 4b. Enriquecimiento opcional con Clay (respaldo, nunca dependencia)
 
@@ -406,7 +521,8 @@ from validate import validate_evidence_quality
 lead = Lead(business_name=..., niche=..., website_problem=..., website_evidence=...,
             high_ticket_score=..., website_opportunity_score=..., data_quality_score=...)
 lead.set_decision_makers([
-    DecisionMaker(name=..., role=..., authority_level=..., is_current=True,
+    DecisionMaker(name=..., role=..., authority_level=..., contact_role=...,  # v4.0: required
+                  is_current=True,
                   phone=..., phone_confidence=..., phone_source=..., phone_evidence=...,
                   verification_status=..., priority=1),
     # ...additional decision-makers, never dropped, priority=2, 3, ...
@@ -551,15 +667,23 @@ entry, not mixed into the cold-email run log.
 ## Files in this skill
 
 - `scripts/schema.py` — canonical `Lead` + `DecisionMaker` dataclasses, 5-tier
-  phone confidence, verification status, authority levels.
+  phone confidence, verification status, authority levels, and (v4.0) the
+  `Owner Contact Role` taxonomy (decision-maker vs. staff/generic roles).
 - `scripts/dedupe.py` — normalization + exact and fuzzy duplicate detection,
   plus cross-lead decision-maker reuse detection.
 - `scripts/scoring.py` — the qualification gate (decision-maker phone tier +
-  is_current + contradiction checks) + separate Lead Quality / Contact
-  Quality scoring + anti-hallucination phone-format and enum validation.
+  is_current + contradiction checks + v4.0 `Owner Contact Role` vault check) +
+  separate Lead Quality / Contact Quality scoring + anti-hallucination
+  phone-format and enum validation.
+- `scripts/role_guard.py` — v4.0: bilingual keyword cross-check
+  (`role_contradicts_evidence`, `detect_non_decision_maker_signals`) that
+  rejects a lead when its phone source/evidence text names a reception/
+  secretary/scheduling/call-center/general-WhatsApp/business-line signal,
+  even if `Owner Contact Role` was (mistakenly) tagged as a decision-maker.
 - `scripts/validate.py` — evidence-quality checks (rejects generic phone
   sources/evidence, vague website-problem text, unrecorded secondary
-  decision-makers).
+  decision-makers, and — v4.0 — re-runs `role_guard`'s contact-role
+  cross-check as defense in depth).
 - `scripts/niche_priority.py` — Niche Opportunity Score ranking from real
   repo/Sheet coverage data, plus `estimate_raw_candidates_needed()` (v3.1) for
   sizing the raw discovery batch per niche from its real historical
@@ -581,8 +705,12 @@ entry, not mixed into the cold-email run log.
   decision-maker, generic/verified-business-only phone rejection,
   named-attribution, contradictory sources, no-website, multi-location,
   former-founder), anti-hallucination checks, decision-maker-reuse, the
-  funnel-sizing helper (v3.1), and a subprocess-level test of `cli.py run`
-  itself (the only thing that caught two real production bugs in this
-  skill's own wiring). Run after any change:
-  `python3 skills/nodoto-lead-hunter/tests/test_pipeline.py`.
+  funnel-sizing helper (v3.1), the v4.0 VAULT suite (unclassified role,
+  every staff role at DIRECT confidence, keyword-contradiction override of a
+  mis-tagged role, legitimate owner/sole-practitioner regression, bilingual
+  keyword detector), and a subprocess-level test of `cli.py run` itself
+  (the only thing that caught two real production bugs in this skill's own
+  wiring — that test's fixture now also includes the exact receptionist-with-
+  perfect-evidence scenario the user reported, asserted to be rejected). Run
+  after any change: `python3 skills/nodoto-lead-hunter/tests/test_pipeline.py`.
 - `tests/candidates_sample.json` — example input shape for `cli.py run`.
