@@ -32,7 +32,10 @@ from scoring import (  # noqa: E402
 )
 from sheets_io import write_csv_mirror, plan_write, verify_write  # noqa: E402
 from validate import validate_evidence_quality  # noqa: E402
-from report import build_clean_export_table  # noqa: E402
+from report import (  # noqa: E402
+    build_clean_export_table, build_clean_export_tables_by_niche,
+    split_leads_by_niche, niche_slug, CLEAN_EXPORT_HEADERS,
+)
 from niche_priority import rank_niches, load_niche_stats_from_repo, estimate_raw_candidates_needed, NicheStats  # noqa: E402
 
 
@@ -561,6 +564,71 @@ def test_estimate_raw_candidates_needed_sizes_the_funnel():
           n_unseen == math.ceil(10 / 0.12))
 
 
+def test_v3_2_clean_export_never_mixes_niches_and_has_a_cold_call_hook():
+    """v3.2 (user directive, 2026-09-15): one clean export / one .xlsx per
+    niche, never mixed — and every qualified row carries a spoken, second-
+    person cold-call line, whether an agent wrote one explicitly or the
+    fallback derived it from the same verified website_problem/evidence."""
+    derma = Lead(
+        business_name="Clinica Derma X", niche="Dermatólogos de tratamientos láser",
+        owner_name="Dra. X", owner_role="Fundadora",
+        owner_phone="+57 300 0000000", owner_phone_source="sitio propio",
+        owner_phone_evidence="wa.me publicado en su sitio personal",
+        owner_phone_confidence=PHONE_CONFIDENCE_DIRECT,
+        owner_verification_status=VERIFICATION_STATUS_VERIFIED,
+        website="https://dermax.example", website_status="LIVE",
+        website_problem="el formulario de contacto no envia confirmacion",
+        website_evidence="se probo el formulario y no llego ningun correo",
+        high_ticket_score=8, website_opportunity_score=7, data_quality_score=7,
+    )
+    abogado = Lead(
+        business_name="Bufete Y", niche="Abogados corporativos",
+        owner_name="Dr. Y", owner_role="Socio Fundador",
+        owner_phone="+57 300 1111111", owner_phone_source="LinkedIn personal",
+        owner_phone_evidence="wa.me enlazado desde su perfil personal de LinkedIn",
+        owner_phone_confidence=PHONE_CONFIDENCE_NAMED_ATTRIBUTION,
+        owner_verification_status=VERIFICATION_STATUS_VERIFIED,
+        website="https://bufeteY.example", website_status="LIVE",
+        website_problem="el sitio corre en HTTP plano sin certificado SSL",
+        website_evidence="el navegador marca la pagina como no segura",
+        high_ticket_score=7, website_opportunity_score=8, data_quality_score=6,
+        cold_call_hook="Cuando entre a su sitio el navegador me marco 'no seguro' porque no tiene HTTPS. ¿15 minutos esta semana?",
+    )
+    groups = split_leads_by_niche([derma, abogado])
+    check("split_leads_by_niche produces exactly 2 groups for 2 distinct niches",
+          set(groups.keys()) == {"Dermatólogos de tratamientos láser", "Abogados corporativos"})
+    check("each niche group contains only its own leads",
+          groups["Dermatólogos de tratamientos láser"] == [derma] and groups["Abogados corporativos"] == [abogado])
+
+    by_niche = build_clean_export_tables_by_niche([derma, abogado])
+    check("build_clean_export_tables_by_niche returns one table per niche, never combined",
+          len(by_niche) == 2 and all(len(rows) == 1 for rows in by_niche.values()))
+    check("CLEAN_EXPORT_HEADERS names the website-URL and cold-call-script columns explicitly",
+          "Sitio Web (URL)" in CLEAN_EXPORT_HEADERS and "Qué decirle en la llamada" in CLEAN_EXPORT_HEADERS)
+
+    derma_row = by_niche["Dermatólogos de tratamientos láser"][0]
+    check("row for a lead without an explicit cold_call_hook gets a derived one, not N/A",
+          derma_row["Qué decirle en la llamada"] and "N/A" not in derma_row["Qué decirle en la llamada"])
+    check("the derived hook is spoken/second-person, not the raw technical sentence verbatim",
+          derma_row["Qué decirle en la llamada"] != derma.website_problem
+          and "15 minutos" in derma_row["Qué decirle en la llamada"])
+    check("the website URL column carries the actual current site, not a placeholder",
+          derma_row["Sitio Web (URL)"] == "https://dermax.example")
+
+    abogado_row = by_niche["Abogados corporativos"][0]
+    check("row for a lead WITH an explicit cold_call_hook uses it verbatim rather than the fallback",
+          abogado_row["Qué decirle en la llamada"] == abogado.cold_call_hook)
+
+    no_site = Lead(business_name="Sin Sitio Z", niche="Abogados corporativos",
+                    owner_name="Dr. Z", owner_phone_confidence=PHONE_CONFIDENCE_DIRECT,
+                    website_status="no_website")
+    no_site_row = build_clean_export_table([no_site])[0]
+    check("a lead with no website gets an explicit N/A hook, never a fabricated one",
+          "N/A" in no_site_row["Qué decirle en la llamada"])
+    check("niche_slug produces a stable, filesystem-safe name for filenames",
+          niche_slug("Dermatólogos de tratamientos láser") == "dermatologos_de_tratamientos_laser")
+
+
 if __name__ == "__main__":
     import tempfile
 
@@ -596,4 +664,7 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as td3:
         test_cli_run_entrypoint_end_to_end(Path(td3))
 
-    print("\nAll self-tests passed (v3: multi-decision-maker + 5-tier confidence + Lead/Contact Quality split).")
+    test_v3_2_clean_export_never_mixes_niches_and_has_a_cold_call_hook()
+
+    print("\nAll self-tests passed (v3.2: multi-decision-maker + 5-tier confidence + Lead/Contact Quality split "
+          "+ per-niche clean export + cold-call hook).")
