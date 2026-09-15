@@ -180,6 +180,11 @@ def build_clean_export_row(lead: Lead) -> dict:
     decisor = f"{lead.owner_name} — {lead.owner_role}" if lead.is_verified("owner_name") else "NOT FOUND"
     if lead.owner_authority_level and lead.owner_authority_level not in ("UNKNOWN", ""):
         decisor += f" ({lead.owner_authority_level})"
+    # v4.0: every qualified lead already passed the vault check (contact_role
+    # is a real decision-maker role, not staff), so this is a visible
+    # confirmation for Mateo, not a re-check — see schema.py's v4.0 note.
+    if lead.owner_contact_role and lead.owner_contact_role not in ("UNKNOWN", ""):
+        decisor += f" [{lead.owner_contact_role}]"
     web = lead.website if lead.is_verified("website") else ("N/A (sin sitio web)" if lead.website_status == "no_website" else "NOT FOUND")
     gancho = lead.cold_call_hook if _is_verified_text(lead.cold_call_hook) else _fallback_cold_call_hook(lead)
     redes = ", ".join(
