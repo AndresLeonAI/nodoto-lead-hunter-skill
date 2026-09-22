@@ -116,7 +116,8 @@ MEMORY_REPO = ("AndresLeonAI", "nodoto-lead-hunter-memory")
 SYNCED_PATHS = ["README.md", "data/bogota_leads.csv", "data/candidates_owner_phone_missing.csv",
                 "data/known_bad_contacts.csv", "data/sent_tracking.csv", "data/niche_coverage.json",
                 "docs/outreach_playbook.md", "docs/run_log.md", "docs/methodology_v3.md",
-                "docs/owner_phone_sources_v3.md", "docs/owner_phone_vault_v4.md"]
+                "docs/owner_phone_sources_v3.md", "docs/owner_phone_vault_v4.md",
+                "data/outreach_log.csv"]
 
 
 def pull_memory_via_composio(run_composio_tool, memory_root: Path) -> list[str]:
