@@ -7,6 +7,7 @@ Run:
     python3 skills/nodoto-lead-hunter/tests/test_pipeline.py
 """
 from __future__ import annotations
+import csv
 import math
 import sys
 from pathlib import Path
@@ -764,6 +765,57 @@ def test_v3_2_clean_export_never_mixes_niches_and_has_a_cold_call_hook():
           niche_slug("Dermatólogos de tratamientos láser") == "dermatologos_de_tratamientos_laser")
 
 
+
+def test_v4_1_niche_ranking_sees_all_memory(tmp: Path):
+    """v4.1: real memory niche names must map onto prior keys, and rejected
+    candidates + niche_coverage.json must count as existing coverage."""
+    import json as _json
+    from niche_priority import canonical_niche_key, load_niche_stats_from_repo
+    check("free-text niche maps to prior key", canonical_niche_key("Dermatólogos de tratamientos láser") == "dermatologia laser")
+    check("alias niche maps to prior key", canonical_niche_key("Bienes raíces comerciales") == "inmobiliario comercial")
+    (tmp / "data").mkdir()
+    with open(tmp / "data" / "candidates_owner_phone_missing.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f); w.writerow(["Business Name", "Niche", "Research Date"])
+        w.writerow(["Clinica X", "Implantes dentales", "2026-09-12"])
+    (tmp / "data" / "niche_coverage.json").write_text(_json.dumps(
+        {"Implantes dentales": {"times_run": 1, "total_qualified": 8, "total_owner_phone_missing": 10}}), encoding="utf-8")
+    st = load_niche_stats_from_repo(tmp)["implantes dentales"]
+    check("coverage counts rejected + unsynced candidates (not 0)", st.existing_leads == 18)
+    check("owner access rate comes from coverage history", abs(st.owner_access_rate - 8 / 18) < 1e-9)
+
+
+def test_v4_1_dedupe_skips_recently_rejected_candidates(tmp: Path):
+    from datetime import date as _d
+    from dedupe import load_recent_owner_missing_csv
+    p = tmp / "m.csv"
+    with open(p, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f); w.writerow(["Business Name", "Niche", "Website", "Research Date"])
+        w.writerow(["Reciente SAS", "X", "https://reciente.co", _d.today().isoformat()])
+        w.writerow(["Viejo SAS", "X", "https://viejo.co", "2020-01-01"])
+    recs = load_recent_owner_missing_csv(p)
+    check("recently rejected candidate is in dedupe set; stale one is re-eligible", len(recs) == 1)
+
+
+def test_v4_1_memory_sync_is_append_only(tmp: Path):
+    import json as _json
+    from memory_sync import merge
+    mem, out = tmp / "mem", tmp / "out"
+    (mem / "data").mkdir(parents=True); out.mkdir()
+    with open(mem / "data" / "bogota_leads.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f); w.writerow(["Business Name", "Niche"]); w.writerow(["Existente", "N1"])
+    with open(out / "qualified_leads_r1.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f); w.writerow(["Business Name", "Niche"])
+        w.writerow(["Existente", "N1"]); w.writerow(["Nuevo", "N1"])
+    with open(out / "candidates_owner_phone_missing_r1.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f); w.writerow(["Business Name", "Niche"]); w.writerow(["Sin Tel", "N1"])
+    res = merge(mem, out, "2026-09-23")
+    rows = list(csv.DictReader(open(mem / "data" / "bogota_leads.csv", encoding="utf-8")))
+    check("memory sync keeps existing rows and appends only new ones", [r["Business Name"] for r in rows] == ["Existente", "Nuevo"] and res["qualified_added"] == 1)
+    check("memory sync persists owner-missing candidates", res["owner_missing_added"] == 1)
+    cov = _json.loads((mem / "data" / "niche_coverage.json").read_text(encoding="utf-8"))
+    check("niche_coverage.json updated by the sync", cov["N1"]["total_qualified"] == 2 and cov["N1"]["total_owner_phone_missing"] == 1)
+
+
 if __name__ == "__main__":
     import tempfile
 
@@ -808,6 +860,11 @@ if __name__ == "__main__":
         test_cli_run_entrypoint_end_to_end(Path(td3))
 
     test_v3_2_clean_export_never_mixes_niches_and_has_a_cold_call_hook()
+
+    for _t in (test_v4_1_niche_ranking_sees_all_memory, test_v4_1_dedupe_skips_recently_rejected_candidates,
+               test_v4_1_memory_sync_is_append_only):
+        with tempfile.TemporaryDirectory() as _td:
+            _t(Path(_td))
 
     print("\nAll self-tests passed (v4.0 VAULT: Owner Contact Role gate + keyword cross-check against "
           "receptionist/secretary/scheduling/call-center/general-WhatsApp/business-line numbers, on top of "

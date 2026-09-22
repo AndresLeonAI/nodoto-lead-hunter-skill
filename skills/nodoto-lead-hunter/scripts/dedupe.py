@@ -221,10 +221,37 @@ def find_decision_maker_reuse(lead: Lead, existing_dm_records: list[ExistingReco
     return hits
 
 
+OWNER_MISSING_RECHECK_DAYS = 45
+
+
+def load_recent_owner_missing_csv(path: Path, recheck_days: int = OWNER_MISSING_RECHECK_DAYS) -> list[ExistingRecord]:
+    """v4.1: businesses already researched and rejected (no decision-maker
+    phone) within the last `recheck_days` are skipped, so daily runs stop
+    re-investigating the same candidates. Older ones become eligible again
+    (owners change, new profiles get published). Rows with no parseable
+    Research Date are treated as recent (skip)."""
+    from datetime import date, datetime, timedelta
+    if not path.exists():
+        return []
+    cutoff = date.today() - timedelta(days=recheck_days)
+    records = []
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        for row in csv.DictReader(f):
+            raw_date = (row.get("Research Date") or "").strip()[:10]
+            try:
+                if datetime.strptime(raw_date, "%Y-%m-%d").date() < cutoff:
+                    continue
+            except ValueError:
+                pass
+            records.append(fingerprint_lead(Lead.from_dict(row), source="candidates_owner_phone_missing.csv"))
+    return records
+
+
 def load_all_repo_sources(repo_root: Path) -> list[ExistingRecord]:
     records = []
     records += load_bogota_leads_csv(repo_root / "data" / "bogota_leads.csv")
     records += load_known_bad_contacts_csv(repo_root / "data" / "known_bad_contacts.csv")
+    records += load_recent_owner_missing_csv(repo_root / "data" / "candidates_owner_phone_missing.csv")
     sent_path = repo_root / "data" / "sent_tracking.csv"
     if sent_path.exists():
         with open(sent_path, newline="", encoding="utf-8") as f:

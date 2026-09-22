@@ -3,6 +3,52 @@ name: nodoto-lead-hunter
 description: High-ticket sales opportunity engine for NODOTO AGENCY. Discovers Bogotá businesses in one niche at a time with weak digital presence, identifies EVERY plausible decision-maker (not just one), verifies the DECISION-MAKER'S OWN phone (never the receptionist's) at one of 5 confidence tiers, audits the real website, scores Lead Quality and Contact Quality separately, dedupes against persistent GitHub memory, and writes only fully-qualified leads to CSV/Sheets. Use when asked to find leads, prospect, hunt for clients, or run lead generation for NODOTO.
 ---
 
+> ## ACTUALIZACIÓN v4.1 (2026-09-22) — memoria que de verdad se guarda, y ranking de nichos que la ve
+>
+> Auditoría de operación diaria. Tres fallas reales, corregidas y cubiertas por tests:
+>
+> 1. **`rank-niches` estaba ciego a la historia.** Solo leía `bogota_leads.csv` y
+>    los nombres reales de nicho ("Dermatólogos de tratamientos láser") nunca
+>    coincidían con las claves ("dermatologia laser") → todos los nichos salían con
+>    `Existing = 0` y la corrida diaria volvía a nichos ya saturados. Ahora
+>    `niche_priority.canonical_niche_key()` normaliza cualquier nombre, y el conteo
+>    suma `bogota_leads.csv` + `candidates_owner_phone_missing.csv` +
+>    `niche_coverage.json` (incluye candidatos que nunca se sincronizaron).
+> 2. **El dedupe ignoraba a los candidatos rechazados** → se re-investigaban los
+>    mismos negocios. `dedupe.load_all_repo_sources()` ahora incluye
+>    `candidates_owner_phone_missing.csv` con fecha de investigación de los últimos
+>    45 días (`OWNER_MISSING_RECHECK_DAYS`); los más viejos vuelven a ser elegibles.
+> 3. **La sincronización de memoria fallaba en cada corrida** (registrado 3 veces en
+>    `run_log.md`): se transcribían CSVs de cientos de KB a mano dentro de un commit.
+>    Nuevo `scripts/memory_sync.py`: `merge()` agrega filas append-only (clave:
+>    nombre normalizado + nicho) y actualiza `niche_coverage.json`;
+>    `pull_memory_via_composio()` / `push_memory_via_composio()` leen y escriben
+>    los archivos DESDE DISCO. **Regla: el modelo nunca transcribe un CSV de memoria.**
+>
+> ### Flujo operativo diario (dónde corre cada cosa)
+>
+> El repo de memoria es privado y el contenedor de la sesión no tiene credenciales
+> de git: todo lo que toca memoria + `cli.py` corre en `COMPOSIO_REMOTE_WORKBENCH`
+> (tiene la conexión GitHub "NODOTO" y `run_composio_tool`). Celda de arranque:
+>
+> ```python
+> import subprocess, sys, os; os.chdir('/home/user')
+> subprocess.run('rm -rf skill mem && git clone -q https://github.com/AndresLeonAI/nodoto-lead-hunter-skill skill', shell=True)
+> sys.path.insert(0, 'skill/skills/nodoto-lead-hunter/scripts')
+> from pathlib import Path; import memory_sync
+> memory_sync.pull_memory_via_composio(run_composio_tool, Path('mem'))
+> print(subprocess.run('cd skill && python3 skills/nodoto-lead-hunter/tests/test_pipeline.py | tail -1 && python3 skills/nodoto-lead-hunter/scripts/cli.py rank-niches --repo-root ../mem --target-qualified 15', shell=True, capture_output=True, text=True).stdout)
+> ```
+>
+> Luego: investigar (sub-agentes, búsqueda web) → escribir cada lote de candidatos
+> como JSON en el workbench (`/home/user/batches/*.json`, un archivo por lote,
+> nunca un blob gigante) → consolidar → una sola `cli.py run ... --repo-root ../mem
+> --out-dir out` → `memory_sync.merge(Path('mem'), Path('skill/out'), fecha)` →
+> `memory_sync.append_run_log(...)` → `push_memory_via_composio(run_composio_tool,
+> Path('mem'), [...rutas cambiadas...], mensaje)` → verificar con
+> `GITHUB_GET_A_TREE` que los tamaños crecieron. Los CSV limpios por nicho se
+> bajan con `upload_local_file` para construir los .xlsx (uno por nicho).
+
 > ## ACTUALIZACIÓN v3 (2026-09-11) — leer esto primero
 >
 > Esta skill fue auditada de forma adversarial (buscando activamente números de
@@ -693,6 +739,7 @@ entry, not mixed into the cold-email run log.
   clean export table, split by niche (v3.2 — `split_leads_by_niche`,
   `build_clean_export_tables_by_niche`, `niche_slug`), plus `cold_call_hook`
   handling (`_fallback_cold_call_hook` for older data).
+- `scripts/memory_sync.py` — v4.1: append-only merge of run outputs into the memory repo + Composio pull/push that read files from disk (never transcribed).
 - `scripts/cli.py` — single entrypoint running dedupe → gate → validate →
   score → write → report over a JSON candidates file; writes one
   `clean_export_<nicho>_<run>.csv` per niche (v3.2).

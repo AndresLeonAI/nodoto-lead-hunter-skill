@@ -79,31 +79,97 @@ def _slugify_niche(value: str) -> str:
     return re.sub(r"\s+", " ", v).strip()
 
 
-def load_niche_stats_from_repo(repo_root: Path) -> dict[str, NicheStats]:
-    """Derives NicheStats from bogota_leads.csv — the ACTUAL header this skill
-    writes is schema.COLUMNS ('Niche', 'Owner Name', 'Owner Phone', ...), so
-    this reads it via Lead.from_dict instead of assuming a different, older
-    column layout (that mismatch was an audit finding: owner_identified_count
-    and owner_phone_count silently stayed at 0 forever against the real
-    memory file, even with real owner data recorded in every row)."""
-    stats: dict[str, NicheStats] = defaultdict(lambda: NicheStats(niche=""))
-    path = repo_root / "data" / "bogota_leads.csv"
+# v4.1: real niche names in memory ("Dermatólogos de tratamientos láser",
+# "Bienes raíces comerciales") rarely equal the prior keys, which made every
+# niche look untouched (Existing=0) and sent daily runs back into saturated
+# niches. canonical_niche_key() maps any free-text niche onto a prior key.
+NICHE_ALIASES: dict[str, str] = {
+    "gestores de patrimonios familiares": "family offices",
+    "abogados de familia divorcios": "divorcio alto conflicto",
+    "bienes raices comerciales": "inmobiliario comercial",
+    "liquidaciones": "patrimonio sucesiones",
+    "reproduccion": "reproduccion asistida",
+    "lasik": "oftalmologia lasik",
+}
+_STOP = {"de", "la", "el", "los", "las", "y", "en", "del", "para", "con", "alto", "altos"}
+
+
+def _prefixes(slug: str) -> set[str]:
+    return {t[:5] for t in slug.split() if len(t) > 2 and t not in _STOP}
+
+
+def canonical_niche_key(value: str) -> str:
+    slug = _slugify_niche(value)
+    if slug in NICHE_VALUE_PRIORS:
+        return slug
+    for alias, key in NICHE_ALIASES.items():
+        if alias in slug:
+            return key
+    mine = _prefixes(slug)
+    best, best_overlap = None, 0
+    for key in NICHE_VALUE_PRIORS:
+        theirs = _prefixes(key)
+        if theirs and (theirs <= mine or (mine and mine <= theirs)):
+            overlap = len(theirs & mine)
+            if overlap > best_overlap:
+                best, best_overlap = key, overlap
+    return best or slug
+
+
+def _read_csv_rows(path: Path) -> list[dict]:
     if not path.exists():
-        return stats
-    with open(path, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
+        return []
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        return list(csv.DictReader(f))
+
+
+def load_niche_stats_from_repo(repo_root: Path) -> dict[str, NicheStats]:
+    """Derives NicheStats from ALL memory: bogota_leads.csv (qualified),
+    candidates_owner_phone_missing.csv (researched but rejected) and
+    niche_coverage.json (run totals, includes candidates that never made it
+    into the CSVs). v4.1: previously only bogota_leads.csv was read and niche
+    names were never canonicalised, so coverage was invisible."""
+    stats: dict[str, NicheStats] = defaultdict(lambda: NicheStats(niche=""))
+    data = repo_root / "data"
+    csv_counts: dict[str, list[int]] = defaultdict(lambda: [0, 0])  # [qualified, missing]
+    for fname, is_qualified in (("bogota_leads.csv", True), ("candidates_owner_phone_missing.csv", False)):
+        for row in _read_csv_rows(data / fname):
             lead = Lead.from_dict(row)
-            niche_raw = lead.niche or "unknown"
-            key = _slugify_niche(niche_raw)
+            niche_raw = (lead.niche or "unknown").strip()
+            key = canonical_niche_key(niche_raw)
             s = stats[key]
-            s.niche = niche_raw
+            s.niche = s.niche or niche_raw
             s.existing_leads += 1
+            csv_counts[key][0 if is_qualified else 1] += 1
             if lead.is_verified("website_problem"):
                 s.website_problem_count += 1
             if lead.is_verified("owner_name"):
                 s.owner_identified_count += 1
-            if lead.is_verified("owner_phone"):
+            if is_qualified and lead.is_verified("owner_phone"):
                 s.owner_phone_count += 1
+    cov_path = data / "niche_coverage.json"
+    if cov_path.exists():
+        import json
+        try:
+            coverage = json.loads(cov_path.read_text(encoding="utf-8"))
+        except ValueError:
+            coverage = {}
+        totals: dict[str, list[int]] = defaultdict(lambda: [0, 0])
+        for niche_raw, c in coverage.items():
+            key = canonical_niche_key(niche_raw)
+            totals[key][0] += int(c.get("total_qualified", 0) or 0)
+            totals[key][1] += int(c.get("total_owner_phone_missing", 0) or 0)
+            stats[key].niche = stats[key].niche or niche_raw
+        for key, (q, m) in totals.items():
+            s = stats[key]
+            cq, cm = csv_counts[key]
+            extra = max(0, q - cq) + max(0, m - cm)
+            if extra:
+                # Unsynced candidates: count them, assume same web-gap rate.
+                rate = s.website_gap_rate
+                s.existing_leads += extra
+                s.website_problem_count += round(extra * rate)
+                s.owner_phone_count += max(0, q - cq)
     return dict(stats)
 
 
@@ -112,7 +178,7 @@ def merge_sheet_owner_stats(stats: dict[str, NicheStats], sheet_rows: list[dict]
     already in the live Google Sheet (or its CSV mirror), keyed by the sheet's
     own 'Niche' column."""
     for row in sheet_rows:
-        key = _slugify_niche(row.get("Niche", ""))
+        key = canonical_niche_key(row.get("Niche", ""))
         s = stats.setdefault(key, NicheStats(niche=row.get("Niche", "")))
         owner_name = (row.get("Owner Name") or "").strip().upper()
         owner_phone = (row.get("Owner Phone") or "").strip().upper()
