@@ -816,6 +816,31 @@ def test_v4_1_memory_sync_is_append_only(tmp: Path):
     check("niche_coverage.json updated by the sync", cov["N1"]["total_qualified"] == 2 and cov["N1"]["total_owner_phone_missing"] == 1)
 
 
+
+def test_v4_2_discovery_without_maps_keeps_raw_target_and_dedupes():
+    import tempfile, json as _j
+    from discovery import build_discovery_plan, merge_discovery, split_into_research_batches, sheet_tab_name
+    no_maps = build_discovery_plan("Dentistas cosméticos", "diseño de sonrisa", 125, maps_available=False)
+    assert all(s["channel"] != "google_maps" for s in no_maps)
+    assert sum(s["target"] for s in no_maps) >= int(125 * 1.3)
+    assert len({s["niche"] for s in no_maps}) == 1  # one niche per run
+    with_maps = build_discovery_plan("Dentistas cosméticos", "diseño de sonrisa", 125, maps_available=True)
+    assert any(s["channel"] == "google_maps" for s in with_maps)
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td); (td / "disc").mkdir(); (td / "mem" / "data").mkdir(parents=True)
+        (td / "mem" / "data" / "bogota_leads.csv").write_text("Business Name,Website,Business Phone,Instagram\nClínica Ya Existe,https://yaexiste.co,,\n", encoding="utf-8")
+        (td / "disc" / "a.json").write_text(_j.dumps([
+            {"business_name": "Clinica Ya Existe", "source_url": "https://x"},
+            {"business_name": "Nueva Sonrisa", "website": "https://nuevasonrisa.co", "source_url": "https://y"},
+            {"business_name": "Nueva Sonrisa SAS", "website": "https://www.nuevasonrisa.co/", "source_url": "https://z"},
+            {"business_name": "Sin Fuente"},
+        ]), encoding="utf-8")
+        r = merge_discovery(td / "disc", td / "mem", "Dentistas cosméticos")
+        assert r["unique"] == 1 and r["dup_memory"] == 1 and r["dup_in_run"] == 1 and r["invalid"] == 1
+        assert len(split_into_research_batches(r["pool"] * 31, 15)) == 3
+    assert sheet_tab_name("2026-09-25") == "NODOTO Auto Leads 2026-09-25"
+    print("[PASS] v4.2 discovery: Maps optional, raw target kept, memory + in-run dedupe, citable URL required, sheet tab name")
+
 if __name__ == "__main__":
     import tempfile
 
@@ -860,6 +885,7 @@ if __name__ == "__main__":
         test_cli_run_entrypoint_end_to_end(Path(td3))
 
     test_v3_2_clean_export_never_mixes_niches_and_has_a_cold_call_hook()
+    test_v4_2_discovery_without_maps_keeps_raw_target_and_dedupes()
 
     for _t in (test_v4_1_niche_ranking_sees_all_memory, test_v4_1_dedupe_skips_recently_rejected_candidates,
                test_v4_1_memory_sync_is_append_only):

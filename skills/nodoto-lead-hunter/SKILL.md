@@ -3,6 +3,61 @@ name: nodoto-lead-hunter
 description: High-ticket sales opportunity engine for NODOTO AGENCY. Discovers Bogotá businesses in one niche at a time with weak digital presence, identifies EVERY plausible decision-maker (not just one), verifies the DECISION-MAKER'S OWN phone (never the receptionist's) at one of 5 confidence tiers, audits the real website, scores Lead Quality and Contact Quality separately, dedupes against persistent GitHub memory, and writes only fully-qualified leads to CSV/Sheets. Use when asked to find leads, prospect, hunt for clients, or run lead generation for NODOTO.
 ---
 
+> ## ACTUALIZACIÓN v4.2 (2026-09-24) — UN nicho por corrida, descubrimiento multi-agente sin depender de Maps, pestaña "NODOTO Auto Leads <fecha>"
+>
+> Directiva explícita del usuario tras la corrida del 2026-09-24 (cuota de Google
+> Maps agotada → 28 candidatos crudos → 4 calificados). Estas reglas **reemplazan**
+> a v3.1/v4.1 donde choquen:
+>
+> 1. **Una corrida = UN nicho.** Se acabó investigar 2-4 nichos por corrida. Se
+>    elige el #1 de `rank-niches` (salvo que se haya trabajado en los últimos 7
+>    días según `niche_coverage.json`; entonces el siguiente). Todo el volumen
+>    (30-50 calificados) sale de ese único nicho. `--niche` lleva un solo nombre.
+>    La sección "1.5 Escalamiento en paralelo" sigue valiendo para el paralelismo
+>    de sub-agentes, NO para mezclar nichos.
+> 2. **Google Maps es un canal opcional, nunca una dependencia.** Al empezar:
+>    `discovery.probe_maps(run_composio_tool)` (UNA llamada). Si responde 429 o
+>    cualquier error → no se reintenta (la cuota es diaria) y el plan usa solo
+>    canales web, **con el mismo objetivo de volumen crudo**. Nunca lanzar 10-18
+>    búsquedas de Maps en paralelo dentro de una celda del workbench (se cuelga a
+>    los 180 s y quema cuota).
+> 3. **Sistema de dos fases con sub-agentes especializados** (`scripts/discovery.py`):
+>    - **Fase A — Descubrimiento (6 sub-agentes en paralelo).**
+>      `python3 scripts/discovery.py plan --niche "<nicho>" --phrase "<frase de búsqueda>" --raw-needed <Raw needed de rank-niches> [--maps] --agents 6`
+>      genera shards canal×zona (Maps, Google web por las 5 zonas de Bogotá,
+>      directorios —Doctoralia, Páginas Amarillas, Cylex, Houzz, colegios—,
+>      Instagram/Facebook/LinkedIn, prensa/rankings, RUES/Cámara de Comercio) con un
+>      objetivo total = Raw needed × 1.3. Cada sub-agente de descubrimiento recibe su
+>      grupo de shards + `references/discovery_agent_prompt.md`, y SOLO devuelve
+>      negocios reales con `source_url` citable (nombre, web, teléfono publicado,
+>      Instagram, dirección, canal) — no investiga decisores. Escribe
+>      `/home/user/discovery/<nicho>_<k>.json` en el workbench.
+>    - **Merge:** `python3 scripts/discovery.py merge --dir /home/user/discovery --repo-root ../mem --niche "<nicho>" --out /home/user/discovery_pool.json`
+>      deduplica contra la memoria y entre shards, descarta todo lo que no tenga
+>      URL de fuente, y parte el pool en `research_inputs/batch_NN.json` de 15.
+>      **Si el pool único < Raw needed, se lanza una segunda ola de descubrimiento
+>      (mismos canales, otras frases de búsqueda/sub-segmentos) antes de investigar.**
+>    - **Fase B — Investigación (1 sub-agente por batch de 15, en paralelo, olas
+>      de hasta 8).** Cada uno recibe su `batch_NN.json` + `references/research_agent_prompt.md`
+>      (pipeline completo: todos los decisores, VAULT v4.0 contact_role, teléfono del
+>      decisor con evidencia y tier, auditoría real del sitio, redes, cold_call_hook,
+>      y los 3 puntajes numéricos obligatorios) y escribe `/home/user/batches/<nicho>_<n>.json`.
+>    - Luego el flujo v4.1 sin cambios: consolidar → UNA `cli.py run` → `memory_sync.merge`
+>      → `append_run_log` → `push_memory_via_composio` → verificar con `GITHUB_GET_A_TREE`.
+> 4. **Dimensionamiento honesto:** con acceso-al-decisor histórico de ~12-25 %, 30-50
+>    calificados requieren 150-300 candidatos crudos únicos. Si tras dos olas el pool
+>    sigue corto, se investiga lo que hay y se reporta el número real — nunca se
+>    relajan VAULT v4.0 ni el gate para "llegar".
+> 5. **Google Sheets: una pestaña nueva por corrida** en el spreadsheet operativo
+>    (`1uEF_rV6uvvHh04hDCPCb1aIc3ohoSuM4t0HBKciFWnw`, cuenta usandresleonus@gmail.com),
+>    llamada exactamente `discovery.sheet_tab_name(fecha)` → **"NODOTO Auto Leads YYYY-MM-DD"**.
+>    Se crea con `GOOGLESHEETS_ADD_SHEET` pasando `force_unique=false` (si no, Composio crea "..._2"; antes lee `GOOGLESHEETS_GET_SHEET_NAMES` — si ya existe esa pestaña para la fecha, se
+>    hace append ahí; nunca se borra ni sobrescribe nada), encabezado = columnas del
+>    clean export, filas con `valueInputOption=RAW` (con USER_ENTERED los teléfonos
+>    "+57 ..." se convierten en `#ERROR!`). "Run Log" sigue recibiendo una fila de
+>    resumen por corrida. "Qualified Leads" ya no se toca.
+> 6. Entregable: sigue siendo un .xlsx (el de ese único nicho) con encabezado NODOTO AGENCY.
+
 > ## ACTUALIZACIÓN v4.1 (2026-09-22) — memoria que de verdad se guarda, y ranking de nichos que la ve
 >
 > Auditoría de operación diaria. Tres fallas reales, corregidas y cubiertas por tests:
@@ -739,6 +794,8 @@ entry, not mixed into the cold-email run log.
   clean export table, split by niche (v3.2 — `split_leads_by_niche`,
   `build_clean_export_tables_by_niche`, `niche_slug`), plus `cold_call_hook`
   handling (`_fallback_cold_call_hook` for older data).
+- `scripts/discovery.py` — v4.2: multi-channel discovery plan (Maps optional), memory+in-run dedupe of discovered businesses, 15-per research batches, Sheet tab name.
+- `references/discovery_agent_prompt.md` / `references/research_agent_prompt.md` — v4.2: exact prompts for the discovery and research sub-agents.
 - `scripts/memory_sync.py` — v4.1: append-only merge of run outputs into the memory repo + Composio pull/push that read files from disk (never transcribed).
 - `scripts/cli.py` — single entrypoint running dedupe → gate → validate →
   score → write → report over a JSON candidates file; writes one
